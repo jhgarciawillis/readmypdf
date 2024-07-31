@@ -7,7 +7,6 @@ import pytesseract
 from gtts import gTTS
 import io
 import spacy
-from google.cloud import language_v1
 
 class Config:
     SUPPORTED_LANGUAGES = {
@@ -24,14 +23,6 @@ class Config:
         'pt': 'por',
         'nl': 'nld'
     }
-
-class GoogleClient:
-    def __init__(self):
-        self.credentials = st.secrets["GOOGLE_APPLICATION_CREDENTIALS"]
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = self.credentials
-
-    def get_language_client(self):
-        return language_v1.LanguageServiceClient()
 
 class PDFProcessor:
     @staticmethod
@@ -116,23 +107,6 @@ class CharacterAnalyzer:
             st.error(f"Language model for {language_code} not found. Please install it using 'python -m spacy download {language_code}_core_web_sm'")
             return []
 
-    @staticmethod
-    def detect_character_attributes(text, language_code, google_client):
-        language_client = google_client.get_language_client()
-        document = language_v1.Document(content=text, type_=language_v1.Document.Type.PLAIN_TEXT, language=language_code)
-        entity_sentiment_response = language_client.analyze_entity_sentiment(document=document)
-        
-        characters = []
-        for entity in entity_sentiment_response.entities:
-            if entity.type_ == language_v1.Entity.Type.PERSON:
-                character = {
-                    "name": entity.name,
-                    "emotion": entity.sentiment.score,
-                }
-                characters.append(character)
-        
-        return characters
-
 class AudioGenerator:
     @staticmethod
     def generate_character_audio(text, language):
@@ -144,7 +118,7 @@ class AudioGenerator:
 
 class PDFToAudioConverter:
     @staticmethod
-    def convert(pdf_file, start_page, language, google_client):
+    def convert(pdf_file, start_page, language):
         try:
             text = PDFProcessor.extract_text(pdf_file, start_page=start_page, language_code=Config.SUPPORTED_LANGUAGES[language])
             if not text:
@@ -152,16 +126,11 @@ class PDFToAudioConverter:
                 return None
 
             character_names = CharacterAnalyzer.detect_character_names(text, language)
-            characters = CharacterAnalyzer.detect_character_attributes(text, language, google_client)
-
-            for character in characters:
-                if character['name'] in character_names:
-                    character['name'] = character_names[character_names.index(character['name'])]
 
             audio_data = {}
-            for character in characters:
+            for character in character_names:
                 audio = AudioGenerator.generate_character_audio(text, language)
-                audio_data[character['name']] = audio
+                audio_data[character] = audio
 
             return audio_data
         except Exception as e:
@@ -171,8 +140,6 @@ class PDFToAudioConverter:
 def main():
     st.title("PDF to Audio Converter")
 
-    google_client = GoogleClient()
-
     pdf_file = st.file_uploader("Upload PDF file", type="pdf")
     
     if pdf_file:
@@ -181,7 +148,7 @@ def main():
         
         if st.button("Convert to Audio"):
             with st.spinner("Converting PDF to audio..."):
-                audio_data = PDFToAudioConverter.convert(pdf_file, start_page, language, google_client)
+                audio_data = PDFToAudioConverter.convert(pdf_file, start_page, language)
             
             if audio_data:
                 st.success(f"Audio generated for {len(audio_data)} characters.")

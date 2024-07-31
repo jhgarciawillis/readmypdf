@@ -1,13 +1,13 @@
 import streamlit as st
 import requests
 import json
-import spacy
 import fitz
 import easyocr
 import cv2
 import os
 import tempfile
 import boto3
+import re
 
 from pathlib import Path
 from boto3 import Session
@@ -117,23 +117,11 @@ class PDFProcessor:
 class CharacterAnalyzer:
     @staticmethod
     @st.cache_data
-    def detect_character_names(text, language_code):
-        try:
-            if language_code == 'en':
-                nlp = spacy.load('en_core_web_sm')
-            elif language_code == 'es':
-                nlp = spacy.load('es_core_news_sm')
-            elif language_code == 'fr':
-                nlp = spacy.load('fr_core_news_sm')
-            else:
-                raise ValueError(f"Unsupported language code: {language_code}")
-
-            doc = nlp(text)
-            character_names = [entity.text for entity in doc.ents if entity.label_ == 'PERSON']
-            return character_names
-        except OSError:
-            st.error(f"Language model for {language_code} not found. Please install it using 'python -m spacy download {language_code}_core_web_sm'")
-            return []
+    def detect_character_names(text):
+        # Simple regex-based name detection (not as accurate as spaCy but doesn't require additional dependencies)
+        name_pattern = r'\b[A-Z][a-z]+ (?:[A-Z][a-z]+ )*[A-Z][a-z]+\b'
+        names = re.findall(name_pattern, text)
+        return list(set(names))  # Remove duplicates
 
     @staticmethod
     def detect_character_attributes(text, language_code, aws_client, google_client):
@@ -202,7 +190,7 @@ class PDFToAudioConverter:
                 st.error("Failed to extract text from PDF.")
                 return None
 
-            character_names = CharacterAnalyzer.detect_character_names(text, language)
+            character_names = CharacterAnalyzer.detect_character_names(text)
             characters = CharacterAnalyzer.detect_character_attributes(text, language, aws_client, google_client)
 
             for character in characters:

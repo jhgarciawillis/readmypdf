@@ -4,9 +4,7 @@ Pillow==10.4.0
 pytesseract==0.3.10
 gTTS==2.5.2
 spacy==3.7.5
-google-cloud-language==2.14.0
-numpy==2.0.1
+numpy==1.22.0
 scipy==1.14.0
 pandas==2.2.2
-spacy==3.7.5
 thinc>=8.2.2,<8.3.0

@@ -1,13 +1,13 @@
 import streamlit as st
 import requests
 import json
+import spacy
 import fitz
 import easyocr
+import cv2
 import os
 import tempfile
 import boto3
-import re
-from PIL import Image, ImageOps
 
 from pathlib import Path
 from boto3 import Session
@@ -65,23 +65,27 @@ class PDFProcessor:
         pdf_document.close()
 
     @staticmethod
-    def detect_margins(image_path):
-        with Image.open(image_path) as img:
-            # Convert image to grayscale
-            img_gray = img.convert('L')
-            # Invert the image
-            img_inv = ImageOps.invert(img_gray)
-            # Get the bounding box of non-zero pixels
-            bbox = img_inv.getbbox()
-            if bbox:
-                return img.crop(bbox)
-            return img
+    def detect_margins(image_path, margin_threshold=10):
+        image = cv2.imread(image_path)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges = cv2.Canny(blur, 50, 150)
+
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        margin_contours = [contour for contour in contours if cv2.contourArea(contour) > margin_threshold]
+
+        if margin_contours:
+            min_x, min_y, max_x, max_y = cv2.boundingRect(max(margin_contours, key=cv2.contourArea))
+            cropped_image = image[min_y:max_y, min_x:max_x]
+            return cropped_image
+        else:
+            return image
 
     @staticmethod
     @st.cache_data
     def extract_text_from_image(image, language_codes):
         reader = easyocr.Reader(language_codes)
-        text = reader.readtext(image)
+        text = reader.read_from_cv2_image(image)
         return ' '.join([word[-2] for word in text])
 
     @staticmethod
@@ -113,10 +117,23 @@ class PDFProcessor:
 class CharacterAnalyzer:
     @staticmethod
     @st.cache_data
-    def detect_character_names(text):
-        name_pattern = r'\b[A-Z][a-z]+ (?:[A-Z][a-z]+ )*[A-Z][a-z]+\b'
-        names = re.findall(name_pattern, text)
-        return list(set(names))  # Remove duplicates
+    def detect_character_names(text, language_code):
+        try:
+            if language_code == 'en':
+                nlp = spacy.load('en_core_web_sm')
+            elif language_code == 'es':
+                nlp = spacy.load('es_core_news_sm')
+            elif language_code == 'fr':
+                nlp = spacy.load('fr_core_news_sm')
+            else:
+                raise ValueError(f"Unsupported language code: {language_code}")
+
+            doc = nlp(text)
+            character_names = [entity.text for entity in doc.ents if entity.label_ == 'PERSON']
+            return character_names
+        except OSError:
+            st.error(f"Language model for {language_code} not found. Please install it using 'python -m spacy download {language_code}_core_web_sm'")
+            return []
 
     @staticmethod
     def detect_character_attributes(text, language_code, aws_client, google_client):
@@ -185,7 +202,7 @@ class PDFToAudioConverter:
                 st.error("Failed to extract text from PDF.")
                 return None
 
-            character_names = CharacterAnalyzer.detect_character_names(text)
+            character_names = CharacterAnalyzer.detect_character_names(text, language)
             characters = CharacterAnalyzer.detect_character_attributes(text, language, aws_client, google_client)
 
             for character in characters:

@@ -2,11 +2,11 @@ import streamlit as st
 import requests
 import json
 import fitz
-import easyocr
 import os
 import tempfile
 import boto3
 from PIL import Image
+import pytesseract
 from pathlib import Path
 from boto3 import Session
 from tqdm import tqdm
@@ -24,9 +24,18 @@ class Config:
     AUDIO_OUTPUT_FORMAT = 'mp3'
     AUDIO_SAMPLE_RATE = '24000'
     SUPPORTED_LANGUAGES = {
-        'en': 'English', 'es': 'Spanish', 'fr': 'French', 'de': 'German',
-        'it': 'Italian', 'ru': 'Russian', 'zh-CN': 'Chinese (Simplified)',
-        'ja': 'Japanese', 'ar': 'Arabic', 'hi': 'Hindi', 'pt': 'Portuguese', 'nl': 'Dutch'
+        'en': 'eng',
+        'es': 'spa',
+        'fr': 'fra',
+        'de': 'deu',
+        'it': 'ita',
+        'ru': 'rus',
+        'zh-CN': 'chi_sim',
+        'ja': 'jpn',
+        'ar': 'ara',
+        'hi': 'hin',
+        'pt': 'por',
+        'nl': 'nld'
     }
 
 class AWSClient:
@@ -85,14 +94,12 @@ class PDFProcessor:
 
     @staticmethod
     @st.cache_data
-    def extract_text_from_image(image_path, language_codes):
-        reader = easyocr.Reader(language_codes)
-        result = reader.readtext(image_path)
-        return ' '.join([word[1] for word in result])
+    def extract_text_from_image(image_path, language_code):
+        return pytesseract.image_to_string(Image.open(image_path), lang=language_code)
 
     @staticmethod
     @st.cache_data
-    def extract_text(pdf_file, start_page=1, end_page=None, language_codes=[]):
+    def extract_text(pdf_file, start_page=1, end_page=None, language_code='eng'):
         text_content = ""
         try:
             with tempfile.TemporaryDirectory() as temp_folder:
@@ -111,9 +118,9 @@ class PDFProcessor:
                             cropped_img = img.crop(bbox)
                             cropped_path = f"{temp_folder}/cropped_page_{page_num}.png"
                             cropped_img.save(cropped_path)
-                        text_content += PDFProcessor.extract_text_from_image(cropped_path, language_codes)
+                        text_content += PDFProcessor.extract_text_from_image(cropped_path, language_code)
                     else:
-                        text_content += PDFProcessor.extract_text_from_image(image_path, language_codes)
+                        text_content += PDFProcessor.extract_text_from_image(image_path, language_code)
                     progress = (page_num - start_page + 2) / (end_page - start_page + 1)
                     progress_bar.progress(progress)
 
@@ -206,7 +213,7 @@ class PDFToAudioConverter:
     @staticmethod
     def convert(pdf_file, start_page, voice_id, engine, language, aws_client, google_client):
         try:
-            text = PDFProcessor.extract_text(pdf_file, start_page=start_page, language_codes=[language])
+            text = PDFProcessor.extract_text(pdf_file, start_page=start_page, language_code=Config.SUPPORTED_LANGUAGES[language])
             if not text:
                 st.error("Failed to extract text from PDF.")
                 return None

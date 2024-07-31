@@ -3,11 +3,11 @@ import requests
 import json
 import fitz
 import easyocr
-import cv2
 import os
 import tempfile
 import boto3
 import re
+from PIL import Image, ImageOps
 
 from pathlib import Path
 from boto3 import Session
@@ -65,27 +65,23 @@ class PDFProcessor:
         pdf_document.close()
 
     @staticmethod
-    def detect_margins(image_path, margin_threshold=10):
-        image = cv2.imread(image_path)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (3, 3), 0)
-        edges = cv2.Canny(blur, 50, 150)
-
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        margin_contours = [contour for contour in contours if cv2.contourArea(contour) > margin_threshold]
-
-        if margin_contours:
-            min_x, min_y, max_x, max_y = cv2.boundingRect(max(margin_contours, key=cv2.contourArea))
-            cropped_image = image[min_y:max_y, min_x:max_x]
-            return cropped_image
-        else:
-            return image
+    def detect_margins(image_path):
+        with Image.open(image_path) as img:
+            # Convert image to grayscale
+            img_gray = img.convert('L')
+            # Invert the image
+            img_inv = ImageOps.invert(img_gray)
+            # Get the bounding box of non-zero pixels
+            bbox = img_inv.getbbox()
+            if bbox:
+                return img.crop(bbox)
+            return img
 
     @staticmethod
     @st.cache_data
     def extract_text_from_image(image, language_codes):
         reader = easyocr.Reader(language_codes)
-        text = reader.read_from_cv2_image(image)
+        text = reader.readtext(image)
         return ' '.join([word[-2] for word in text])
 
     @staticmethod
@@ -118,7 +114,6 @@ class CharacterAnalyzer:
     @staticmethod
     @st.cache_data
     def detect_character_names(text):
-        # Simple regex-based name detection (not as accurate as spaCy but doesn't require additional dependencies)
         name_pattern = r'\b[A-Z][a-z]+ (?:[A-Z][a-z]+ )*[A-Z][a-z]+\b'
         names = re.findall(name_pattern, text)
         return list(set(names))  # Remove duplicates

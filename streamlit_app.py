@@ -1,8 +1,9 @@
 import streamlit as st
 import requests
 import json
-import spacy
 import fitz
+import easyocr
+import cv2
 import os
 import tempfile
 import boto3
@@ -14,11 +15,10 @@ from google.cloud import language_v1, speech, vision
 
 # Handle potential import errors
 try:
-    import easyocr
-    import cv2
+    import spacy
 except ImportError as e:
-    st.error(f"Error importing required libraries: {e}")
-    st.error("Please make sure all required libraries are installed correctly.")
+    st.error(f"Error importing spacy: {e}")
+    st.error("Please make sure spacy and its dependencies are installed correctly.")
     st.stop()
 
 class Config:
@@ -121,7 +121,118 @@ class PDFProcessor:
             pdf_document.close()
         return text_content
 
-# ... [rest of the classes remain unchanged] ...
+class CharacterAnalyzer:
+    @staticmethod
+    @st.cache_data
+    def detect_character_names(text, language_code):
+        try:
+            if language_code == 'en':
+                nlp = spacy.load('en_core_web_sm')
+            elif language_code == 'es':
+                nlp = spacy.load('es_core_news_sm')
+            elif language_code == 'fr':
+                nlp = spacy.load('fr_core_news_sm')
+            else:
+                raise ValueError(f"Unsupported language code: {language_code}")
+
+            doc = nlp(text)
+            character_names = [entity.text for entity in doc.ents if entity.label_ == 'PERSON']
+            return character_names
+        except OSError:
+            st.error(f"Language model for {language_code} not found. Please install it using 'python -m spacy download {language_code}_core_web_sm'")
+            return []
+
+    @staticmethod
+    def detect_character_attributes(text, language_code, aws_client, google_client):
+        comprehend_client = aws_client.get_comprehend_client()
+        emotion_response = comprehend_client.detect_sentiment(Text=text, LanguageCode=language_code)
+        emotion = emotion_response['Sentiment'].lower()
+        
+        language_client = google_client.get_language_client()
+        document = language_v1.Document(content=text, type_=language_v1.Document.Type.PLAIN_TEXT, language=language_code)
+        entity_sentiment_response = language_client.analyze_entity_sentiment(document=document)
+        
+        characters = []
+        for entity in entity_sentiment_response.entities:
+            if entity.type_ == language_v1.Entity.Type.PERSON:
+                vision_client = google_client.get_vision_client()
+                image = vision.Image(content=entity.name.encode('utf-8'))
+                response = vision_client.face_detection(image=image)
+                face = response.face_annotations[0] if response.face_annotations else None
+                
+                gender = face.gender.lower() if face and face.gender else ""
+                age = face.age_range.low if face and face.age_range else ""
+                
+                character = {
+                    "name": entity.name,
+                    "gender": gender,
+                    "age": age,
+                    "emotion": entity.sentiment.score,
+                    "pace": ""
+                }
+                characters.append(character)
+        
+        return characters
+
+class AudioGenerator:
+    @staticmethod
+    def generate_character_audio(text, character, voice_id, engine, language, aws_client):
+        polly = aws_client.get_polly_client()
+
+        voice_settings = {
+            'Engine': engine,
+            'LanguageCode': language,
+            'VoiceId': voice_id,
+            'TextType': 'ssml'
+        }
+
+        emotion_tag = f'<amazon:emotion name="{character["emotion"]}" intensity="medium">' if character["emotion"] else ''
+        rate_tag = f'<prosody rate="{character["pace"]}">'
+
+        ssml_text = f'<speak>{emotion_tag}{rate_tag}{text}</prosody></amazon:emotion></speak>'
+
+        response = polly.synthesize_speech(
+            Text=ssml_text,
+            OutputFormat=Config.AUDIO_OUTPUT_FORMAT,
+            SampleRate=Config.AUDIO_SAMPLE_RATE,
+            **voice_settings
+        )
+
+        return response['AudioStream'].read()
+
+class PDFToAudioConverter:
+    @staticmethod
+    def convert(pdf_file, start_page, voice_id, engine, language, aws_client, google_client):
+        try:
+            text = PDFProcessor.extract_text(pdf_file, start_page=start_page, language_codes=[language])
+            if not text:
+                st.error("Failed to extract text from PDF.")
+                return None
+
+            character_names = CharacterAnalyzer.detect_character_names(text, language)
+            characters = CharacterAnalyzer.detect_character_attributes(text, language, aws_client, google_client)
+
+            for character in characters:
+                if character['name'] in character_names:
+                    character['name'] = character_names[character_names.index(character['name'])]
+
+            audio_data = {}
+            for character in characters:
+                audio = AudioGenerator.generate_character_audio(text, character, voice_id, engine, language, aws_client)
+                audio_data[character['name']] = audio
+
+            return audio_data
+        except Exception as e:
+            st.error(f"An unexpected error occurred: {e}")
+            return None
+
+class VoiceManager:
+    @staticmethod
+    def list_voices(language_code, aws_client):
+        polly = aws_client.get_polly_client()
+        response = polly.describe_voices(LanguageCode=language_code)
+        voices = response['Voices']
+        return [(voice['Id'], f"{voice['Id']} ({voice['Gender']})") for voice in voices]
 
 def main():
     st.title("PDF to Audio Converter")

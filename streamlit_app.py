@@ -3,11 +3,10 @@ import requests
 import json
 import fitz
 import easyocr
-import cv2
 import os
 import tempfile
 import boto3
-
+from PIL import Image
 from pathlib import Path
 from boto3 import Session
 from tqdm import tqdm
@@ -67,33 +66,29 @@ class PDFProcessor:
         pdf_document = fitz.open(stream=pdf_file.read(), filetype="pdf")
         for page_index in range(len(pdf_document)):
             page = pdf_document[page_index]
-            image = page.get_pixmap()
-            image.save(f"{output_folder}/page_{page_index}.png")
+            pix = page.get_pixmap()
+            pix.save(f"{output_folder}/page_{page_index}.png")
         pdf_document.close()
 
     @staticmethod
-    def detect_margins(image_path, margin_threshold=10):
-        image = cv2.imread(image_path)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (3, 3), 0)
-        edges = cv2.Canny(blur, 50, 150)
-
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        margin_contours = [contour for contour in contours if cv2.contourArea(contour) > margin_threshold]
-
-        if margin_contours:
-            min_x, min_y, max_x, max_y = cv2.boundingRect(max(margin_contours, key=cv2.contourArea))
-            cropped_image = image[min_y:max_y, min_x:max_x]
-            return cropped_image
-        else:
-            return image
+    def detect_margins(image_path):
+        with Image.open(image_path) as img:
+            bg = Image.new(img.mode, img.size, img.getpixel((0,0)))
+            diff = Image.new(img.mode, img.size)
+            for x in range(img.width):
+                for y in range(img.height):
+                    pixel = img.getpixel((x, y))
+                    if pixel != bg.getpixel((x, y)):
+                        diff.putpixel((x, y), pixel)
+            bbox = diff.getbbox()
+        return bbox
 
     @staticmethod
     @st.cache_data
-    def extract_text_from_image(image, language_codes):
+    def extract_text_from_image(image_path, language_codes):
         reader = easyocr.Reader(language_codes)
-        text = reader.read_from_cv2_image(image)
-        return ' '.join([word[-2] for word in text])
+        result = reader.readtext(image_path)
+        return ' '.join([word[1] for word in result])
 
     @staticmethod
     @st.cache_data
@@ -110,8 +105,15 @@ class PDFProcessor:
                 progress_bar = st.progress(0)
                 for page_num in range(start_page - 1, end_page):
                     image_path = f"{temp_folder}/page_{page_num}.png"
-                    cropped_image = PDFProcessor.detect_margins(image_path)
-                    text_content += PDFProcessor.extract_text_from_image(cropped_image, language_codes)
+                    bbox = PDFProcessor.detect_margins(image_path)
+                    if bbox:
+                        with Image.open(image_path) as img:
+                            cropped_img = img.crop(bbox)
+                            cropped_path = f"{temp_folder}/cropped_page_{page_num}.png"
+                            cropped_img.save(cropped_path)
+                        text_content += PDFProcessor.extract_text_from_image(cropped_path, language_codes)
+                    else:
+                        text_content += PDFProcessor.extract_text_from_image(image_path, language_codes)
                     progress = (page_num - start_page + 2) / (end_page - start_page + 1)
                     progress_bar.progress(progress)
 

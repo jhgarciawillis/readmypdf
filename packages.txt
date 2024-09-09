@@ -12,4 +12,4 @@ tesseract-ocr-ara
 tesseract-ocr-hin
 tesseract-ocr-por
 tesseract-ocr-nld
-spacy==3.7.6
+spacy

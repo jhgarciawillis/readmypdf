@@ -12,4 +12,3 @@ tesseract-ocr-ara
 tesseract-ocr-hin
 tesseract-ocr-por
 tesseract-ocr-nld
-spacy

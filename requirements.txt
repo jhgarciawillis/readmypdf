@@ -1,0 +1,103 @@
+# ============================================================
+# readmypdf — Requirements
+# Verified latest compatible versions as of April 2026
+# Python >= 3.10 required (enforced by streamlit & pymupdf)
+# ============================================================
+
+# --- Core UI ---
+streamlit==1.56.0
+# Released: Mar 31, 2026 — latest stable. Requires Python >=3.10.
+
+# --- PDF Processing ---
+PyMuPDF==1.27.2.2
+# Released: Mar 19, 2026 — latest stable.
+# BREAKING CHANGE from 1.24.x: import as `import pymupdf` (not `import fitz`).
+# `import fitz` still works as an alias but is deprecated.
+# Native text extraction via page.get_text("dict") used in text mode.
+# OCR fallback via get_textpage_ocr() integrated directly (no separate pytesseract
+# call needed for PyMuPDF's own OCR), but we still use pytesseract for
+# compatibility and richer bbox data.
+
+# --- OCR (fallback for scanned PDFs) ---
+pytesseract==0.3.13
+# Released: Jan 2024 — latest stable (no newer release as of Apr 2026).
+# Requires Tesseract binary installed separately (see packages.txt).
+
+# --- Image Processing (used by OCR mode) ---
+Pillow==12.2.0
+# Released: Apr 1, 2026 — latest stable.
+# BREAKING CHANGE from 10.x: some deprecated APIs removed.
+# Used for image manipulation in OCR fallback mode only.
+
+# --- Text-to-Speech ---
+gTTS==2.5.4
+# Released: latest stable as of Apr 2026.
+# Free, uses Google Translate TTS endpoint (unofficial, no API key required).
+# Rate limits apply under heavy use — use openai TTS for production.
+
+# --- Audio Processing ---
+pydub==0.25.1
+# Last release (2021) — still the de-facto standard, no newer version.
+# Requires ffmpeg system binary for MP3 encode/decode (see packages.txt).
+
+# --- NLP ---
+spacy==3.8.14
+# Released: Mar 29, 2026 — latest stable.
+# NOTE: 3.7.6 (used in original project) was YANKED from PyPI.
+# spaCy 3.8 requires downloading language models separately:
+#   python -m spacy download en_core_web_sm
+#   python -m spacy download es_core_news_sm
+#   python -m spacy download fr_core_news_sm
+# Models are NOT installed via pip — must be run post-install.
+
+# --- OpenAI TTS (optional premium engine) ---
+openai==2.30.0
+# Released: Mar 25, 2026 — latest stable.
+# BREAKING CHANGE from 1.x: Client interface changed significantly in 2.x.
+# Used only when OPENAI_API_KEY env var is set.
+# Provides `client.audio.speech.create(model="tts-1", voice="onyx")`.
+# Optional — app runs fully without it using gTTS.
+
+# --- Numerical (transitive dep for spaCy, pinned for stability) ---
+numpy>=1.26.4,<3.0.0
+# spaCy 3.8 requires numpy >=1.26. No strict upper bound needed.
+
+# --- HTTP (transitive dep for gTTS and openai, pinned for safety) ---
+requests>=2.32.0
+# gTTS uses requests internally. openai uses httpx but requests still needed.
+
+# ============================================================
+# SYSTEM DEPENDENCIES (installed via packages.txt, NOT pip):
+#   tesseract-ocr        — OCR engine for scanned PDFs
+#   ffmpeg               — Audio encode/decode for pydub
+#   libsm6, libxext6     — Required by some Pillow builds on Linux
+# ============================================================
+
+# ============================================================
+# POST-INSTALL STEPS:
+#   1. Set env vars (optional but recommended):
+#      OPENAI_API_KEY=sk-...     (enables premium TTS)
+#      EXTRACTION_MODE=auto      (auto|text|ocr, default: auto)
+#      TTS_ENGINE=gtts           (gtts|openai, default: gtts)
+#
+#   2. Download spaCy models:
+#      python -m spacy download en_core_web_sm
+#      python -m spacy download es_core_news_sm
+#      python -m spacy download fr_core_news_sm
+#
+#   3. Run:
+#      streamlit run streamlit_app.py
+# ============================================================
+
+# ============================================================
+# REMOVED FROM ORIGINAL (unused in codebase):
+#   scipy==1.14.0         — never imported
+#   matplotlib==3.9.1     — never imported
+#   seaborn==0.13.2       — never imported
+#   scikit-learn==1.5.1   — never imported
+#   joblib==1.4.2         — never imported
+#   beautifulsoup4==4.12.3 — never imported
+#   tqdm==4.66.4          — never imported
+#   pandas==2.2.2         — never imported
+#   spacy==3.7.6 (duplicate line removed)
+# ============================================================

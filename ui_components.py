@@ -627,90 +627,200 @@ class UIComponents:
 
     @staticmethod
     def render_analysis_panel(
-        keywords:     list,
-        characters:   list,
-        summary:      str,
-        sentiment:    dict,
-        reading_time: str,
-        word_count:   int,
+        keywords:        list,
+        characters:      list,
+        summary:         str,
+        sentiment:       dict,
+        reading_time:    str,
+        word_count:      int,
+        readability:     dict  = None,
+        text_stats:      dict  = None,
+        content_type:    dict  = None,
+        topic_density:   list  = None,
+        chapter_complexity: list = None,
     ) -> None:
         """
-        Render the document analysis panel inside an expander.
-
-        Displays NLP analysis results computed by TextAnalyzer.
-        Gracefully handles empty/None values for any individual field —
-        each section is only rendered if data is available.
-
-        Args:
-          keywords:     list of (word, frequency) tuples
-          characters:   list of character name strings
-          summary:      extractive summary string
-          sentiment:    dict from TextAnalyzer.sentiment_analysis()
-          reading_time: string from TextAnalyzer.get_reading_time_estimate()
-          word_count:   int from TextAnalyzer.get_word_count()
+        Rich document analysis panel with KPIs, readability scores,
+        topic density, chapter complexity, and content type detection.
         """
-        with st.expander("📊 Document Analysis", expanded=True):
+        st.subheader("📊 Document Intelligence")
 
-            # Stats row
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Word count", f"{word_count:,}")
-            with col2:
-                st.metric("Est. listening time", reading_time)
+        # ── ROW 1: Core KPIs ──────────────────────────────────────────
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Words", f"{word_count:,}")
+        with c2:
+            st.metric("Est. Listening Time", reading_time)
+        if text_stats:
+            with c3:
+                st.metric("Unique Words", f"{text_stats.get('unique_words', 0):,}")
+            with c4:
+                vr = text_stats.get("vocabulary_richness", 0)
+                st.metric("Vocabulary Richness", f"{vr}%",
+                          help="Unique words ÷ total words × 100. Higher = more diverse language.")
+
+        st.divider()
+
+        # ── ROW 2: Readability + Content Type ─────────────────────────
+        col_read, col_type = st.columns([3, 2])
+
+        with col_read:
+            st.markdown("**📖 Readability**")
+            if readability:
+                fe  = readability.get("flesch_ease", 0)
+                fk  = readability.get("flesch_kincaid", 0)
+                gl  = readability.get("grade_label", "Unknown")
+                el  = readability.get("ease_label", "Unknown")
+
+                r1, r2, r3 = st.columns(3)
+                with r1:
+                    st.metric("Flesch Ease", f"{fe}/100",
+                              help="0=hardest, 100=easiest. 60-70 is standard adult reading.")
+                with r2:
+                    st.metric("Grade Level", f"{fk}",
+                              help="US school grade equivalent of the text complexity.")
+                with r3:
+                    st.metric("Reading Level", gl)
+
+                # Visual ease bar
+                bar_color = (
+                    "🟢" if fe >= 70 else
+                    "🟡" if fe >= 50 else
+                    "🔴"
+                )
+                st.caption(f"{bar_color} {el} — {int(fe)}% ease score")
+
+                if text_stats:
+                    s1, s2, s3 = st.columns(3)
+                    with s1:
+                        st.metric("Avg Sentence Length",
+                                  f"{text_stats.get('avg_sentence_length', 0)} words",
+                                  help="Sentences >25 words are hard to follow in audio.")
+                    with s2:
+                        st.metric("Avg Word Length",
+                                  f"{text_stats.get('avg_word_length', 0)} chars")
+                    with s3:
+                        st.metric("Total Sentences",
+                                  f"{text_stats.get('total_sentences', 0):,}")
+            else:
+                st.caption("Readability data unavailable.")
+
+        with col_type:
+            st.markdown("**🔍 Content Type**")
+            if content_type:
+                ct   = content_type.get("type", "General")
+                conf = content_type.get("confidence", 0)
+
+                type_icons = {
+                    "Academic":           "🎓",
+                    "Report / Analysis":  "📈",
+                    "Fiction / Narrative": "📚",
+                    "News / Article":     "📰",
+                    "Technical":          "⚙️",
+                    "Legal":              "⚖️",
+                    "General":            "📄",
+                }
+                icon = type_icons.get(ct, "📄")
+                st.metric(f"{icon} Detected Type", ct)
+                st.caption(f"Confidence: {conf}%")
+
+                # Show signal breakdown
+                all_scores = content_type.get("all_scores", {})
+                if all_scores:
+                    top = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)[:3]
+                    for label, score in top:
+                        if score > 0:
+                            st.caption(f"  • {label}: {score} signals")
+            else:
+                st.caption("Content type detection unavailable.")
+
+        st.divider()
+
+        # ── ROW 3: Summary + Sentiment ────────────────────────────────
+        col_sum, col_sent = st.columns([3, 2])
+
+        with col_sum:
+            st.markdown("**📝 Summary**")
+            if summary:
+                st.write(summary)
+                st.caption("Extractive — first 3 sentences of document body.")
+            else:
+                st.caption("Summary unavailable.")
+
+        with col_sent:
+            st.markdown("**🎭 Tone & Sentiment**")
+            if sentiment:
+                label = sentiment.get("label", "Unknown")
+                conf  = sentiment.get("confidence", "low")
+                pos   = sentiment.get("positive_count", 0)
+                neg   = sentiment.get("negative_count", 0)
+                total = pos + neg or 1
+
+                color_map = {"Positive": "🟢", "Negative": "🔴", "Neutral": "🟡"}
+                icon = color_map.get(label, "⚪")
+
+                st.metric(f"{icon} Tone", label)
+                st.caption(f"Confidence: {conf}")
+
+                # Mini signal bar
+                pos_pct = round(pos / total * 100)
+                neg_pct = 100 - pos_pct
+                st.caption(
+                    f"🟢 {pos} positive  •  🔴 {neg} negative"
+                )
+            else:
+                st.caption("Sentiment data unavailable.")
+
+        st.divider()
+
+        # ── ROW 4: Topic Density ──────────────────────────────────────
+        if topic_density:
+            st.markdown("**🔑 Topic Density** *(occurrences per 1,000 words)*")
+            for item in topic_density[:12]:
+                word    = item["word"]
+                density = item["density_per_1k"]
+                bar_pct = item["bar_pct"]
+                count   = item["count"]
+                # Simple inline bar using unicode blocks
+                filled  = int(bar_pct / 5)  # max 20 chars
+                bar     = "█" * filled + "░" * (20 - filled)
+                st.markdown(
+                    f"`{word:<18}` {bar} **{density}**/1k  *(×{count})*",
+                    unsafe_allow_html=False,
+                )
+            st.divider()
+
+        # ── ROW 5: Chapter Complexity ─────────────────────────────────
+        if chapter_complexity:
+            st.markdown("**📊 Complexity by Chapter** *(hardest → easiest to follow)*")
+            st.caption(
+                "Lower Flesch score = harder to follow while listening. "
+                "Consider re-reading complex chapters after listening."
+            )
+            for item in chapter_complexity:
+                title  = item["title"]
+                ease   = item["flesch_ease"]
+                label  = item["ease_label"]
+                wc     = item["word_count"]
+                icon   = "🔴" if ease < 50 else ("🟡" if ease < 70 else "🟢")
+                short  = title if len(title) <= 40 else title[:37] + "…"
+                st.markdown(
+                    f"{icon} **{short}** — {label} ({ease}/100) · {wc:,} words"
+                )
 
             st.divider()
 
-            # Sentiment
-            if sentiment:
-                label = sentiment.get("label", "Unknown")
-                confidence = sentiment.get("confidence", "low")
-                pos = sentiment.get("positive_count", 0)
-                neg = sentiment.get("negative_count", 0)
+        # ── ROW 6: Recurring Names ────────────────────────────────────
+        if characters:
+            st.markdown("**👥 Recurring Names / Entities**")
+            st.write("  •  ".join(characters[:20]))
+            st.divider()
 
-                color_map = {
-                    "Positive": "🟢",
-                    "Negative": "🔴",
-                    "Neutral":  "🟡",
-                }
-                icon = color_map.get(label, "⚪")
-
-                st.markdown(
-                    f"**Sentiment:** {icon} {label} "
-                    f"<small style='color:gray'>({confidence} confidence — "
-                    f"{pos} positive signals, {neg} negative signals)</small>",
-                    unsafe_allow_html=True,
-                )
-                st.divider()
-
-            # Summary
-            if summary:
-                st.markdown("**Summary**")
-                st.write(summary)
-                st.caption(
-                    "Extractive summary: first 3 sentences of the document."
-                )
-                st.divider()
-
-            # Keywords
-            if keywords:
-                st.markdown("**Top Keywords**")
-                # Display as a compact word-frequency list
-                kw_parts = [
-                    f"**{word}** ({count})"
-                    for word, count in keywords[:10]
-                ]
-                st.write("  •  ".join(kw_parts))
-                st.divider()
-
-            # Characters
-            if characters:
-                st.markdown("**Recurring Names / Characters**")
-                st.write(", ".join(characters[:15]))
-            elif keywords is not None:
-                # Only show this message if NLP ran but found nothing
-                st.caption(
-                    "No recurring character names detected."
-                )
+        # ── ROW 7: Keywords ───────────────────────────────────────────
+        if keywords:
+            st.markdown("**💬 Top Keywords**")
+            kw_parts = [f"**{w}** ({c})" for w, c in keywords[:15]]
+            st.write("  •  ".join(kw_parts))
 
     # ================================================================== #
     # SECTION 7 — COST ESTIMATION                                         #

@@ -344,32 +344,24 @@ def _render_analysis_section(
     lang_code: str,
 ) -> None:
     """
-    Compute and render the NLP analysis panel.
-
-    Separated from render_results() for clarity. Runs NLP analysis
-    on the full document text (all chapters concatenated) and passes
-    results to UIComponents.render_analysis_panel().
-
-    This is called lazily — only when show_analysis is True in settings.
-    NLP analysis can be slow for large documents, so it's not run
-    automatically.
-
-    Args:
-      document_structure: dict from TextAnalyzer.build_document_structure()
-      lang_code:          language code for NLP model selection
+    Compute and render the full document intelligence panel.
+    Called lazily — only when show_analysis is True in settings.
     """
-    chapters = document_structure["chapters"]
-    full_text = TextAnalyzer.get_full_text(chapters)
-    word_count = TextAnalyzer.get_word_count(full_text)
+    chapters     = document_structure["chapters"]
+    full_text    = TextAnalyzer.get_full_text(chapters)
+    word_count   = TextAnalyzer.get_word_count(full_text)
     reading_time = TextAnalyzer.get_reading_time_estimate(full_text)
 
     with st.spinner("Running document analysis…"):
-        # All NLP methods gracefully return empty results if spaCy
-        # model is unavailable — no special error handling needed here
-        keywords   = TextAnalyzer.extract_keywords(full_text, lang_code)
-        characters = TextAnalyzer.detect_character_names(full_text, lang_code)
-        summary    = TextAnalyzer.summarize_text(full_text, lang_code)
-        sentiment  = TextAnalyzer.sentiment_analysis(full_text, lang_code)
+        keywords           = TextAnalyzer.extract_keywords(full_text, lang_code)
+        characters         = TextAnalyzer.detect_character_names(full_text, lang_code)
+        summary            = TextAnalyzer.summarize_text(full_text, lang_code)
+        sentiment          = TextAnalyzer.sentiment_analysis(full_text, lang_code)
+        readability        = TextAnalyzer.compute_readability(full_text)
+        text_stats         = TextAnalyzer.compute_text_stats(full_text, chapters)
+        content_type       = TextAnalyzer.detect_content_type(full_text, chapters)
+        topic_density      = TextAnalyzer.compute_topic_density(full_text, keywords)
+        chapter_complexity = TextAnalyzer.detect_language_complexity_by_chapter(chapters)
 
     UIComponents.render_analysis_panel(
         keywords=keywords,
@@ -378,6 +370,11 @@ def _render_analysis_section(
         sentiment=sentiment,
         reading_time=reading_time,
         word_count=word_count,
+        readability=readability,
+        text_stats=text_stats,
+        content_type=content_type,
+        topic_density=topic_density,
+        chapter_complexity=chapter_complexity,
     )
 
 

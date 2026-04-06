@@ -391,6 +391,296 @@ class TextAnalyzer:
         }
 
     # ================================================================== #
+    # SECTION 3B - EXTENDED DOCUMENT ANALYSIS                           #
+    # All methods take plain text strings. No external dependencies.    #
+    # ================================================================== #
+
+    @staticmethod
+    def compute_readability(text: str) -> dict:
+        """
+        Compute Flesch Reading Ease and Flesch-Kincaid Grade Level.
+
+        Flesch Reading Ease (0-100):
+          90-100 = Very Easy (5th grade)
+          60-70  = Standard (8th-9th grade)
+          30-50  = Difficult (college)
+          0-30   = Very Difficult (professional)
+
+        Flesch-Kincaid Grade Level: US school grade equivalent.
+
+        Both are computed from syllable count, word count, sentence count.
+        Syllable counting uses the vowel-group heuristic (fast, ~90% accurate).
+
+        Returns dict with: flesch_ease, flesch_kincaid, grade_label, ease_label
+        """
+        import re
+
+        def count_syllables(word: str) -> int:
+            word = word.lower().strip('.,!?;:\'"')
+            if len(word) <= 3:
+                return 1
+            # Count vowel groups as syllable approximation
+            vowels = re.findall(r"[aeiouy]+", word)
+            count  = len(vowels)
+            # Subtract silent e at end
+            if word.endswith("e") and count > 1:
+                count -= 1
+            return max(1, count)
+
+        sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+        words     = re.findall(r"[a-zA-Z]+", text)
+
+        if not sentences or not words:
+            return {
+                "flesch_ease": 0, "flesch_kincaid": 0,
+                "grade_label": "Unknown", "ease_label": "Unknown",
+            }
+
+        num_sentences = len(sentences)
+        num_words     = len(words)
+        num_syllables = sum(count_syllables(w) for w in words)
+
+        # Avoid division by zero
+        if num_sentences == 0 or num_words == 0:
+            return {
+                "flesch_ease": 0, "flesch_kincaid": 0,
+                "grade_label": "Unknown", "ease_label": "Unknown",
+            }
+
+        asl = num_words / num_sentences         # avg sentence length
+        asw = num_syllables / num_words         # avg syllables per word
+
+        flesch_ease     = round(206.835 - 1.015 * asl - 84.6 * asw, 1)
+        flesch_ease     = max(0, min(100, flesch_ease))
+        flesch_kincaid  = round(0.39 * asl + 11.8 * asw - 15.59, 1)
+        flesch_kincaid  = max(0, flesch_kincaid)
+
+        # Labels
+        if flesch_ease >= 90:
+            ease_label = "Very Easy"
+        elif flesch_ease >= 70:
+            ease_label = "Easy"
+        elif flesch_ease >= 60:
+            ease_label = "Standard"
+        elif flesch_ease >= 50:
+            ease_label = "Fairly Difficult"
+        elif flesch_ease >= 30:
+            ease_label = "Difficult"
+        else:
+            ease_label = "Very Difficult"
+
+        if flesch_kincaid <= 6:
+            grade_label = "Elementary"
+        elif flesch_kincaid <= 9:
+            grade_label = "Middle School"
+        elif flesch_kincaid <= 12:
+            grade_label = "High School"
+        elif flesch_kincaid <= 16:
+            grade_label = "University"
+        else:
+            grade_label = "Post-Graduate"
+
+        return {
+            "flesch_ease":      flesch_ease,
+            "flesch_kincaid":   flesch_kincaid,
+            "grade_label":      grade_label,
+            "ease_label":       ease_label,
+        }
+
+    @staticmethod
+    def compute_text_stats(text: str, chapters: OrderedDict) -> dict:
+        """
+        Compute detailed text statistics useful for audio listeners.
+
+        Returns dict with:
+          total_words, unique_words, vocabulary_richness,
+          avg_sentence_length, avg_word_length,
+          longest_chapter, shortest_chapter,
+          chapter_distribution (list of {title, word_count, pct}),
+          total_sentences, paragraphs
+        """
+        import re
+        from collections import OrderedDict as OD
+
+        words     = re.findall(r"[a-zA-Z]+", text.lower())
+        sentences = [s for s in re.split(r"[.!?]+", text) if s.strip()]
+        paras     = [p for p in re.split(r'\n\n+', text) if p.strip()]
+
+        total_words   = len(words)
+        unique_words  = len(set(words))
+        vocab_rich    = round(unique_words / total_words * 100, 1) if total_words > 0 else 0
+        avg_sent_len  = round(total_words / len(sentences), 1) if sentences else 0
+        avg_word_len  = round(sum(len(w) for w in words) / total_words, 1) if total_words > 0 else 0
+
+        # Chapter distribution
+        chapter_dist = []
+        for title, ch_text in chapters.items():
+            ch_words = len(re.findall(r"[a-zA-Z]+", ch_text))
+            pct      = round(ch_words / total_words * 100, 1) if total_words > 0 else 0
+            chapter_dist.append({
+                "title":      title,
+                "word_count": ch_words,
+                "pct":        pct,
+            })
+
+        # Longest and shortest chapters by word count
+        if chapter_dist:
+            longest  = max(chapter_dist, key=lambda x: x["word_count"])
+            shortest = min(chapter_dist, key=lambda x: x["word_count"])
+        else:
+            longest = shortest = {"title": "N/A", "word_count": 0, "pct": 0}
+
+        return {
+            "total_words":        total_words,
+            "unique_words":       unique_words,
+            "vocabulary_richness": vocab_rich,
+            "avg_sentence_length": avg_sent_len,
+            "avg_word_length":    avg_word_len,
+            "total_sentences":    len(sentences),
+            "paragraphs":         len(paras),
+            "longest_chapter":    longest,
+            "shortest_chapter":   shortest,
+            "chapter_distribution": chapter_dist,
+        }
+
+    @staticmethod
+    def detect_content_type(text: str, chapters: OrderedDict) -> dict:
+        """
+        Detect the content type of the document from structural and
+        linguistic signals.
+
+        Types: Academic, Report/Analysis, Fiction/Narrative,
+               News/Article, Technical, Legal, General
+
+        Returns dict: { type, confidence, signals }
+        """
+        import re
+
+        full_lower = text.lower()
+        scores     = {
+            "Academic":           0,
+            "Report / Analysis":  0,
+            "Fiction / Narrative": 0,
+            "News / Article":     0,
+            "Technical":          0,
+            "Legal":              0,
+        }
+
+        # Academic signals
+        academic_terms = ["abstract", "methodology", "hypothesis", "conclusion",
+                          "references", "et al", "study", "research", "findings",
+                          "analysis", "literature", "cited", "peer-reviewed"]
+        scores["Academic"] += sum(full_lower.count(t) for t in academic_terms)
+
+        # Report/analysis signals
+        report_terms = ["framework", "kpi", "revenue", "market", "strategy",
+                        "growth", "forecast", "quarter", "fiscal", "benchmark",
+                        "insight", "pattern", "failure", "success", "rate"]
+        scores["Report / Analysis"] += sum(full_lower.count(t) for t in report_terms)
+
+        # Fiction signals
+        fiction_terms = ["said", "whispered", "shouted", "felt", "thought",
+                         "walked", "smiled", "chapter", "protagonist", "character"]
+        scores["Fiction / Narrative"] += sum(full_lower.count(t) for t in fiction_terms)
+        # Dialogue is a strong fiction signal
+        dialogue_count = len(re.findall(r'"[^"]{5,}"', text))
+        scores["Fiction / Narrative"] += dialogue_count * 3
+
+        # News/article signals
+        news_terms = ["according to", "reported", "announced", "government",
+                      "officials", "sources said", "press release", "interview"]
+        scores["News / Article"] += sum(full_lower.count(t) for t in news_terms)
+
+        # Technical signals
+        tech_terms = ["function", "algorithm", "implementation", "api",
+                      "configuration", "parameter", "database", "module",
+                      "variable", "syntax", "library", "framework"]
+        scores["Technical"] += sum(full_lower.count(t) for t in tech_terms)
+        # Code-like patterns
+        scores["Technical"] += len(re.findall(r"[a-z_]+\([^\)]*\)", text)) * 2
+
+        # Legal signals
+        legal_terms = ["whereas", "hereby", "pursuant", "notwithstanding",
+                       "jurisdiction", "liability", "clause", "agreement",
+                       "parties", "indemnify", "covenant", "shall"]
+        scores["Legal"] += sum(full_lower.count(t) for t in legal_terms)
+
+        # Determine winner
+        top_type   = max(scores, key=scores.get)
+        top_score  = scores[top_type]
+        total      = sum(scores.values()) or 1
+        confidence = round(top_score / total * 100, 0)
+
+        if top_score < 5:
+            top_type   = "General"
+            confidence = 0
+
+        # Top signals that drove the detection
+        top_signals = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
+
+        return {
+            "type":       top_type,
+            "confidence": int(confidence),
+            "signals":    top_signals,
+            "all_scores": scores,
+        }
+
+    @staticmethod
+    def compute_topic_density(text: str, keywords: list) -> list:
+        """
+        Compute how densely each top keyword appears across the document,
+        expressed as occurrences per 1,000 words.
+
+        Args:
+          text:     full document text
+          keywords: list of (word, count) tuples from extract_keywords()
+
+        Returns list of dicts: { word, count, density_per_1k, bar_pct }
+        where bar_pct is 0-100 relative to the most frequent term.
+        """
+        import re
+        total_words = len(re.findall(r"\w+", text))
+        if not keywords or total_words == 0:
+            return []
+
+        max_count  = keywords[0][1] if keywords else 1
+        result     = []
+        for word, count in keywords[:15]:
+            density = round(count / total_words * 1000, 2)
+            bar_pct = round(count / max_count * 100)
+            result.append({
+                "word":           word,
+                "count":          count,
+                "density_per_1k": density,
+                "bar_pct":        bar_pct,
+            })
+        return result
+
+    @staticmethod
+    def detect_language_complexity_by_chapter(chapters: OrderedDict) -> list:
+        """
+        Compute readability score per chapter so the user can see which
+        sections are hardest to follow while listening.
+
+        Returns list of dicts: { title, flesch_ease, ease_label, word_count }
+        sorted from hardest to easiest.
+        """
+        results = []
+        for title, text in chapters.items():
+            if not text.strip():
+                continue
+            r = TextAnalyzer.compute_readability(text)
+            import re
+            wc = len(re.findall(r"\w+", text))
+            results.append({
+                "title":       title,
+                "flesch_ease": r["flesch_ease"],
+                "ease_label":  r["ease_label"],
+                "word_count":  wc,
+            })
+        return sorted(results, key=lambda x: x["flesch_ease"])
+
+    # ================================================================== #
     # SECTION 4 - UTILITIES                                              #
     # ================================================================== #
 

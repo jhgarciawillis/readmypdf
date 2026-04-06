@@ -195,6 +195,50 @@ class TextCleaner:
         return repeated_texts
 
     @staticmethod
+    def is_noise_pattern(text: str) -> bool:
+        """
+        Return True if the text matches a known structural noise pattern
+        that should always be excluded from TTS, regardless of position.
+
+        Catches patterns that vary per-page so repetition detection misses them:
+          - "Page 1 of 7", "Page 2 of 7", "Página 1 de 7"
+          - Standalone page numbers: "1", "42", "- 3 -"
+          - Short author/brand bylines that repeat with slight variation
+          - Common footer boilerplate
+        """
+        import re
+        t = text.strip()
+
+        # "Page X of Y" in English and Spanish
+        if re.fullmatch(
+            r"[Pp]age\s+\d+\s+of\s+\d+|[Pp]ágina\s+\d+\s+de\s+\d+",
+            t
+        ):
+            return True
+
+        # Standalone integer (page number on its own)
+        if re.fullmatch(r"\d{1,4}", t):
+            return True
+
+        # "- 3 -" or "— 3 —" style page numbers
+        if re.fullmatch(r"[-—–]\s*\d{1,4}\s*[-—–]", t):
+            return True
+
+        # Very short lines that are only symbols/dashes (dividers)
+        if re.fullmatch(r"[-—–_=*·•]{2,}", t):
+            return True
+
+        # "Confidential", "Draft", "Internal Use Only" type stamps
+        if re.fullmatch(
+            r"(Confidential|Draft|Internal Use Only|All Rights Reserved|"
+            r"Todos los derechos reservados|Uso interno)",
+            t, re.IGNORECASE
+        ):
+            return True
+
+        return False
+
+    @staticmethod
     def filter_blocks(
         page_blocks: list[dict],
         repeated_texts: set[str],
@@ -246,6 +290,11 @@ class TextCleaner:
             # Check 2: repeated text
             if remove_repeated and text in repeated_texts:
                 logger.debug(f"Removed (repeated text): '{text[:60]}'")
+                continue
+
+            # Check 3: pattern-based noise (page numbers, "Page X of Y", etc.)
+            if remove_repeated and TextCleaner.is_noise_pattern(text):
+                logger.debug(f"Removed (noise pattern): '{text[:60]}'")
                 continue
 
             filtered.append(block)

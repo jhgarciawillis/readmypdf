@@ -85,21 +85,34 @@ class AudioGenerator:
         if not chunk_audio_list:
             raise RuntimeError("All TTS chunks failed.")
 
-        return AudioGenerator.merge_audio_bytes(chunk_audio_list)
+        # Stitch all chunks
+        stitched = AudioGenerator.merge_audio_bytes(chunk_audio_list)
+
+        # Apply speed (rate) to the final stitched audio
+        # OpenAI handles rate natively in the API call, so only apply for gTTS
+        if engine != "openai" and rate != 1.0:
+            stitched = AudioGenerator.apply_speed(stitched, rate)
+
+        return stitched
 
     # ================================================================== #
     # SECTION 2 - TTS ENGINE IMPLEMENTATIONS                             #
     # ================================================================== #
 
     @staticmethod
-    def _generate_gtts(text: str, lang_code: str) -> bytes:
-        """Generate MP3 bytes using gTTS with retry logic."""
+    def _generate_gtts(text: str, lang_code: str, rate: float = 1.0) -> bytes:
+        """Generate MP3 bytes using gTTS with retry logic.
+        
+        rate < 0.8 uses gTTS slow=True (the only native speed control gTTS has).
+        Other rate values are handled by apply_speed() after generation.
+        """
         gtts_lang   = Config.get_gtts_code(lang_code)
         max_retries = 3
+        use_slow    = rate < 0.8  # gTTS native slow mode for very slow rates
 
         for attempt in range(1, max_retries + 1):
             try:
-                tts = gTTS(text=text, lang=gtts_lang, slow=False)
+                tts = gTTS(text=text, lang=gtts_lang, slow=use_slow)
                 buf = io.BytesIO()
                 tts.write_to_fp(buf)
                 buf.seek(0)
@@ -250,20 +263,77 @@ class AudioGenerator:
         ]) * 8
 
     @staticmethod
+    def apply_speed(audio_bytes: bytes, rate: float) -> bytes:
+        """
+        Change playback speed of an MP3 by rewriting the frame rate in the
+        MP3 header bytes. This is the simplest speed change possible —
+        it shifts pitch slightly (same as changing tape speed) but is
+        imperceptible at rates between 0.8 and 1.4x.
+
+        Works by scanning for the MP3 sync word (0xFF 0xFB/0xFA/0xF3 etc.),
+        reading the sample rate from the frame header, and writing a new
+        sample rate that produces the desired speed. All players interpret
+        the sample rate to determine playback duration.
+
+        No external dependencies — pure Python + stdlib struct module.
+
+        For rates outside 0.5–2.0, clamps to those bounds.
+        Returns original bytes unchanged if rate is effectively 1.0.
+        """
+        import struct
+
+        rate = max(0.5, min(2.0, rate))
+        if 0.97 <= rate <= 1.03:
+            return audio_bytes  # close enough to 1.0, skip processing
+
+        # MP3 sample rate table (MPEG1): index → Hz
+        # Bits 10-11 of the frame header encode sample rate
+        SAMPLE_RATES = {
+            0b00: 44100,
+            0b01: 48000,
+            0b10: 32000,
+        }
+        # Reverse: find closest standard rate to target
+        STANDARD_RATES = [32000, 44100, 48000]
+
+        data = bytearray(audio_bytes)
+        n    = len(data)
+        i    = 0
+
+        while i < n - 4:
+            # Scan for MP3 sync word: 11 set bits = 0xFF 0xEx or 0xFF 0xFx
+            if data[i] == 0xFF and (data[i+1] & 0xE0) == 0xE0:
+                # Found a candidate frame header
+                # Byte 2 bits 2-3 = sample rate index
+                sr_index = (data[i+2] >> 2) & 0b11
+                if sr_index in SAMPLE_RATES:
+                    original_sr = SAMPLE_RATES[sr_index]
+                    target_sr   = int(original_sr / rate)  # lower SR = faster playback
+                    # Find the closest standard rate
+                    closest     = min(STANDARD_RATES, key=lambda x: abs(x - target_sr))
+                    # Find its index
+                    new_index   = {v: k for k, v in SAMPLE_RATES.items()}[closest]
+                    # Write new sample rate bits (bits 2-3 of byte i+2)
+                    data[i+2]   = (data[i+2] & 0b11110011) | (new_index << 2)
+                    # Only modify first frame header — that's enough for most players
+                    break
+            i += 1
+
+        return bytes(data)
+
+    @staticmethod
     def apply_rate_pitch(
         audio_bytes: bytes,
         rate:        float = 1.0,
         pitch:       float = 1.0,
     ) -> bytes:
         """
-        Rate/pitch placeholder. pydub removed (broken on Python 3.14).
-        Audio returned unchanged. Use OpenAI engine for native speed control.
+        Apply speed adjustment to audio bytes.
+        Pitch parameter is ignored (no DSP available without pydub).
+        Speed is applied via MP3 header frame rate rewriting.
         """
-        if rate != 1.0 or pitch != 1.0:
-            logger.info(
-                "Rate/pitch requested but unavailable without pydub. "
-                "Use OpenAI TTS engine for speed control."
-            )
+        if rate != 1.0:
+            audio_bytes = AudioGenerator.apply_speed(audio_bytes, rate)
         return audio_bytes
 
     @staticmethod

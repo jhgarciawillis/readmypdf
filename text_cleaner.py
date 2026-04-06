@@ -178,7 +178,7 @@ class TextCleaner:
                 key = (y_mid_norm, text)
                 occurrence_map[key].add(page_num)
 
-        # Collect texts that appear on enough pages
+        # Collect texts that appear on enough pages at the same Y band
         repeated_texts: set[str] = set()
         for (y_band, text), pages in occurrence_map.items():
             if len(pages) >= Config.REPEAT_THRESHOLD:
@@ -187,6 +187,38 @@ class TextCleaner:
                     f"Flagged as header/footer (appears on {len(pages)} pages "
                     f"at y_band={y_band:.2f}): '{text[:60]}'"
                 )
+
+        # Second pass: flag ALL text at Y-bands that are structurally repeated
+        # even if individual span text differs slightly (e.g. split bylines).
+        # Any Y-band that has SOME text appearing on >= REPEAT_THRESHOLD pages
+        # is treated as a header/footer zone — all text at that band is flagged.
+        repeated_ybands: set[float] = set()
+        yband_page_count: dict[float, set] = defaultdict(set)
+        for (y_band, text), pages in occurrence_map.items():
+            if len(pages) >= Config.REPEAT_THRESHOLD:
+                repeated_ybands.add(y_band)
+            # Also track how many distinct pages each y_band appears on
+            yband_page_count[y_band].update(pages)
+
+        # Flag all spans at confirmed repeated Y-bands
+        for page_blocks in all_page_blocks:
+            for block in page_blocks:
+                text = block.get("text", "").strip()
+                if not text:
+                    continue
+                page_height = block.get("page_height", 1.0)
+                if page_height <= 0:
+                    continue
+                y0 = block.get("y0", 0.0)
+                y1 = block.get("y1", 0.0)
+                y_mid = (y0 + y1) / 2.0
+                y_mid_norm = round(y_mid / page_height, Config.Y_BAND_PRECISION)
+                if y_mid_norm in repeated_ybands:
+                    if text not in repeated_texts:
+                        repeated_texts.add(text)
+                        logger.debug(
+                            f"Flagged (shared Y-band {y_mid_norm:.2f}): '{text[:60]}'"
+                        )
 
         logger.info(
             f"Header/footer detection: flagged {len(repeated_texts)} "
@@ -234,6 +266,16 @@ class TextCleaner:
             r"Todos los derechos reservados|Uso interno)",
             t, re.IGNORECASE
         ):
+            return True
+
+        # Pipe-separated byline pattern: "Author Name | Publication Name"
+        # Common in academic/professional PDFs as running headers
+        if re.fullmatch(r"[A-Za-zÀ-ÿ\s\.\,]+\|[A-Za-zÀ-ÿ\s\.\,]+", t):
+            return True
+
+        # Short text that is only uppercase — likely a section stamp or label
+        # e.g. "CONFIDENTIAL", "DRAFT", "APPENDIX A"
+        if len(t) <= 30 and t == t.upper() and re.search(r"[A-Z]", t):
             return True
 
         return False

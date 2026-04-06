@@ -234,7 +234,7 @@ def run_pipeline(
                 f"Audio generation failed for '{chapter_title}': {e}"
             )
             # Insert silence so the chapter still appears in the player
-            audio_data[chapter_title] = AudioGenerator._generate_silence(1000)
+            audio_data[chapter_title] = AudioGenerator._generate_silence_bytes()
 
     progress_bar.progress(1.0, text="Audio generation complete.")
 

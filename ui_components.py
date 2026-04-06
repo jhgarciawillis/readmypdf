@@ -192,14 +192,6 @@ class UIComponents:
         )
         selected_code = code_list[label_list.index(selected_label)]
 
-        # Warn if no spaCy model available for this language
-        if not Config.has_spacy_support(selected_code):
-            st.caption(
-                f"ℹ️ NLP analysis (keywords, characters, summary) is not "
-                f"available for {selected_label}. "
-                f"PDF extraction and TTS work normally."
-            )
-
         return selected_code
 
     @staticmethod

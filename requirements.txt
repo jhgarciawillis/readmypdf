@@ -3,6 +3,7 @@ PyMuPDF==1.27.2.2
 pytesseract==0.3.13
 Pillow==12.2.0
 gTTS==2.5.4
+mutagen==1.47.0
 spacy==3.8.11
 openai==2.30.0
 numpy>=1.26.4,<3.0.0

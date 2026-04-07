@@ -29,6 +29,8 @@ Core design decisions:
 """
 
 import os
+import io
+import re
 import base64
 import logging
 from collections import OrderedDict
@@ -549,6 +551,88 @@ class UIComponents:
         st.caption(
             f"Chapter {current_idx + 1} of {len(titles)}"
         )
+
+    # ================================================================== #
+    # SECTION 4B — DOWNLOAD BUTTONS                                       #
+    # ================================================================== #
+
+    @staticmethod
+    def render_download_buttons(
+        audio_data:      dict,
+        current_chapter: str,
+        chapters:        "OrderedDict",
+    ) -> None:
+        """
+        Render download buttons for current chapter and full book.
+
+        Chapter download: current chapter MP3 only.
+        Full book download: all chapters stitched in order with 2s silence
+        between chapters. Built on-demand from session state bytes —
+        no temp files, no extra dependencies.
+
+        Args:
+          audio_data:      { chapter_title: mp3_bytes }
+          current_chapter: title of the currently active chapter
+          chapters:        OrderedDict of all chapters (for ordering)
+        """
+        st.markdown("**⬇️ Downloads**")
+        col1, col2 = st.columns(2)
+
+        # ── Chapter download ──────────────────────────────────────────
+        with col1:
+            chapter_audio = audio_data.get(current_chapter, b"")
+            if chapter_audio:
+                safe_title = re.sub(r"[^a-zA-Z0-9_-]", "_", current_chapter)[:40]
+                st.download_button(
+                    label="📥 This Chapter",
+                    data=chapter_audio,
+                    file_name=f"{safe_title}.mp3",
+                    mime="audio/mpeg",
+                    use_container_width=True,
+                    help=f"Download '{current_chapter}' as MP3",
+                )
+            else:
+                st.button("📥 This Chapter", disabled=True, use_container_width=True)
+
+        # ── Full book download ────────────────────────────────────────
+        with col2:
+            if len(audio_data) > 0:
+                # Build full book bytes: chapters in order with 2s silence gap
+                # 2 seconds of silence as minimal MP3 frames (~32 frames)
+                silence_gap = bytes([
+                    0xFF, 0xFB, 0x90, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                ]) * 32  # ~2 seconds
+
+                # Stitch in chapter order
+                buf = io.BytesIO()
+                chapter_order = list(chapters.keys())
+                for i, title in enumerate(chapter_order):
+                    ch_audio = audio_data.get(title, b"")
+                    if ch_audio:
+                        buf.write(ch_audio)
+                        if i < len(chapter_order) - 1:
+                            buf.write(silence_gap)
+
+                full_book_bytes = buf.getvalue()
+
+                if full_book_bytes:
+                    st.download_button(
+                        label="📚 Full Book",
+                        data=full_book_bytes,
+                        file_name="full_book.mp3",
+                        mime="audio/mpeg",
+                        use_container_width=True,
+                        help=f"Download all {len(audio_data)} chapters as one MP3",
+                    )
+                else:
+                    st.button("📚 Full Book", disabled=True, use_container_width=True)
+            else:
+                st.button("📚 Full Book", disabled=True, use_container_width=True)
 
     # ================================================================== #
     # SECTION 5 — BOOKMARKS                                               #

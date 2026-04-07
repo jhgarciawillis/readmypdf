@@ -336,13 +336,33 @@ class TextAnalyzer:
         num_sentences: int = 3,
     ) -> str:
         """
-        Extractive summary: return first N sentences using period splitting.
-        Simple but reliable without spaCy.
+        Extractive summary: return first N content sentences.
+        Skips noise lines (bylines, headers, short metadata lines).
         """
+        from text_cleaner import TextCleaner
         # Split on sentence-ending punctuation followed by space + capital
         sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z])", text.strip())
-        sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
-        return " ".join(sentences[:num_sentences])
+        content_sentences = []
+        for s in sentences:
+            s = s.strip()
+            # Skip short lines, noise patterns, and pipe-separated bylines
+            if len(s) < 30:
+                continue
+            if TextCleaner.is_noise_pattern(s):
+                continue
+            # Skip lines that look like bylines/headers (Name | Role | Date)
+            if s.count("|") >= 1 and len(s) < 100:
+                continue
+            # Skip lines starting with "By " (authorship lines)
+            if re.match(r"^By\s+[A-Z]", s):
+                continue
+            # Skip reference/source lines
+            if re.match(r"^\d+\.\s+[A-Z]", s) and len(s) < 120:
+                continue
+            content_sentences.append(s)
+            if len(content_sentences) >= num_sentences:
+                break
+        return " ".join(content_sentences)
 
     @staticmethod
     def sentiment_analysis(
@@ -428,7 +448,7 @@ class TextAnalyzer:
             return max(1, count)
 
         sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
-        words     = re.findall(r"[a-zA-Z]+", text)
+        words     = re.findall(r"\b[a-zA-Z]+\b", text)
 
         if not sentences or not words:
             return {
@@ -502,7 +522,7 @@ class TextAnalyzer:
         import re
         from collections import OrderedDict as OD
 
-        words     = re.findall(r"[a-zA-Z]+", text.lower())
+        words     = re.findall(r"\b[a-zA-Z]+\b", text.lower())
         sentences = [s for s in re.split(r"[.!?]+", text) if s.strip()]
         paras     = [p for p in re.split(r'\n\n+', text) if p.strip()]
 
@@ -515,7 +535,7 @@ class TextAnalyzer:
         # Chapter distribution
         chapter_dist = []
         for title, ch_text in chapters.items():
-            ch_words = len(re.findall(r"[a-zA-Z]+", ch_text))
+            ch_words = len(re.findall(r"\b[a-zA-Z]+\b", ch_text))
             pct      = round(ch_words / total_words * 100, 1) if total_words > 0 else 0
             chapter_dist.append({
                 "title":      title,
@@ -639,7 +659,7 @@ class TextAnalyzer:
         where bar_pct is 0-100 relative to the most frequent term.
         """
         import re
-        total_words = len(re.findall(r"\w+", text))
+        total_words = len(re.findall(r"\b\w+\b", text))
         if not keywords or total_words == 0:
             return []
 
@@ -671,7 +691,7 @@ class TextAnalyzer:
                 continue
             r = TextAnalyzer.compute_readability(text)
             import re
-            wc = len(re.findall(r"\w+", text))
+            wc = len(re.findall(r"\b\w+\b", text))
             results.append({
                 "title":       title,
                 "flesch_ease": r["flesch_ease"],

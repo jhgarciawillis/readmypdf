@@ -333,6 +333,14 @@ def render_results() -> None:
 
         UIComponents.render_progress(current_chapter, chapters)
 
+        st.divider()
+
+        UIComponents.render_download_buttons(
+            audio_data=audio_data,
+            current_chapter=current_chapter,
+            chapters=chapters,
+        )
+
     # ---- Analysis panel ----
     if settings.get("show_analysis", False):
         st.divider()

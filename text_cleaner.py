@@ -281,6 +281,97 @@ class TextCleaner:
         return False
 
     @staticmethod
+    def get_last_content_block(page_blocks: list[dict]) -> dict | None:
+        """
+        Return the physically lowest non-noise block on a page.
+
+        "Lowest" means highest y1 value — closest to the bottom of the page.
+        Noise blocks (page numbers, headers, footers matching is_noise_pattern)
+        are skipped so we always get the last real content block.
+
+        If all blocks on the page are noise, returns None.
+
+        Args:
+          page_blocks: list of block dicts for a single page
+
+        Returns:
+          The block dict with the highest y1 among non-noise blocks,
+          or None if none found.
+        """
+        content_blocks = [
+            b for b in page_blocks
+            if b.get("text", "").strip()
+            and not TextCleaner.is_noise_pattern(b.get("text", "").strip())
+        ]
+        if not content_blocks:
+            return None
+        return max(content_blocks, key=lambda b: b.get("y1", 0.0))
+
+    @staticmethod
+    def get_page_fingerprint(page_blocks: list[dict], n_words: int = None) -> str:
+        """
+        Extract the last N words from the last content block on a page.
+        Used to verify page completeness — if these words appear in the
+        assembled chapter text, the page was fully captured.
+
+        Args:
+          page_blocks: list of block dicts for a single page
+          n_words:     number of words to use (default: Config.LAST_WORDS_FINGERPRINT_COUNT)
+
+        Returns:
+          Lowercase string of the last N words, space-joined.
+          Empty string if no content blocks found.
+        """
+        import re
+        if n_words is None:
+            n_words = Config.LAST_WORDS_FINGERPRINT_COUNT
+
+        last_block = TextCleaner.get_last_content_block(page_blocks)
+        if not last_block:
+            return ""
+
+        text  = last_block.get("text", "").strip()
+        words = re.findall(r"[a-zA-ZÀ-ÿ]+", text)  # letters only, handles accents
+
+        if not words:
+            return ""
+
+        # Take last n_words, lowercase for comparison
+        fingerprint = " ".join(words[-n_words:]).lower()
+        return fingerprint
+
+    @staticmethod
+    def fingerprint_in_text(fingerprint: str, text: str) -> bool:
+        """
+        Check whether a page fingerprint (last N words) appears in
+        the assembled chapter text.
+
+        Comparison is case-insensitive and ignores punctuation between words
+        so "said Holmes" matches "said Holmes." or "said  Holmes".
+
+        Args:
+          fingerprint: string from get_page_fingerprint()
+          text:        assembled chapter text to search within
+
+        Returns:
+          True if the fingerprint words appear consecutively in text.
+          False if fingerprint is empty or not found.
+        """
+        import re
+        if not fingerprint or not text:
+            return False
+
+        fp_words = fingerprint.lower().split()
+        if len(fp_words) < Config.FINGERPRINT_MIN_WORDS:
+            # Fingerprint too short — unreliable, assume complete
+            return True
+
+        # Build a regex that matches the words with any punctuation/whitespace
+        # between them: "said holmes" matches "said, Holmes" or "said Holmes."
+        pattern = r"\s*".join(re.escape(w) for w in fp_words)
+        return bool(re.search(pattern, text.lower()))
+
+    @staticmethod
     def filter_blocks(
         page_blocks: list[dict],
         repeated_texts: set[str],

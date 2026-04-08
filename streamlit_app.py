@@ -307,21 +307,41 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
             st.session_state.incomplete_pages = incomplete_pages
 
             if incomplete_pages:
-                # Rebuild chapters without blocks from flagged pages
-                clean_blocks = [
-                    b for b in blocks
-                    if b.get("page_num") not in incomplete_pages
-                ]
-                rebuilt = TextAnalyzer.build_document_structure(
-                    blocks=clean_blocks,
-                    lang_code=lang_code,
-                    remove_headers=remove_hf,
-                )
-                chapters                       = rebuilt["chapters"]
-                document_structure["chapters"] = chapters
-                logger.info(
-                    f"Removed content from {len(incomplete_pages)} incomplete pages."
-                )
+                # Only remove incomplete pages if we won't lose most content
+                total_pages_in_blocks = len(set(b.get("page_num",0) for b in blocks))
+                pct_flagged = len(incomplete_pages) / max(total_pages_in_blocks, 1)
+                if pct_flagged > 0.5:
+                    # More than 50% of pages flagged = fingerprint unreliable
+                    # (likely single-chapter doc where last page = last page of doc)
+                    logger.warning(
+                        f"Incomplete page detection flagged {pct_flagged:.0%} of pages — "
+                        f"likely false positives in a single-chapter document. Skipping removal."
+                    )
+                    st.session_state.incomplete_pages = set()
+                    incomplete_pages = set()
+                else:
+                    clean_blocks = [
+                        b for b in blocks
+                        if b.get("page_num") not in incomplete_pages
+                    ]
+                    rebuilt = TextAnalyzer.build_document_structure(
+                        blocks=clean_blocks,
+                        lang_code=lang_code,
+                        remove_headers=remove_hf,
+                    )
+                    # Safety: only use rebuilt if it has substantial content
+                    rebuilt_text = " ".join(rebuilt["chapters"].values())
+                    original_text = " ".join(chapters.values())
+                    if len(rebuilt_text) > len(original_text) * 0.3:
+                        chapters                       = rebuilt["chapters"]
+                        document_structure["chapters"] = chapters
+                        logger.info(f"Removed content from {len(incomplete_pages)} incomplete pages.")
+                    else:
+                        logger.warning(
+                            "Incomplete page removal would lose >70% of content — skipping."
+                        )
+                        st.session_state.incomplete_pages = set()
+                        incomplete_pages = set()
 
     # ------------------------------------------------------------------ #
     # STAGE 10: Post-hoc incomplete chapter detection and removal          #
@@ -332,15 +352,21 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
             st.session_state.incomplete_chapters = incomplete_chapters
 
             if incomplete_chapters:
-                before_count = len(chapters)
-                chapters     = OrderedDict(
-                    (t, v) for t, v in chapters.items()
-                    if t not in incomplete_chapters
-                )
-                document_structure["chapters"] = chapters
-                logger.info(
-                    f"Removed {before_count - len(chapters)} incomplete chapters."
-                )
+                # Only remove if it won't wipe everything
+                if len(incomplete_chapters) >= len(chapters):
+                    logger.warning(
+                        "Incomplete chapter detection would remove all chapters — skipping."
+                    )
+                    st.session_state.incomplete_chapters = set()
+                    incomplete_chapters = set()
+                else:
+                    before_count = len(chapters)
+                    chapters     = OrderedDict(
+                        (t, v) for t, v in chapters.items()
+                        if t not in incomplete_chapters
+                    )
+                    document_structure["chapters"] = chapters
+                    logger.info(f"Removed {before_count - len(chapters)} incomplete chapters.")
 
     if not chapters:
         UIComponents.render_error(
@@ -497,13 +523,17 @@ def render_results() -> None:
             selected_lang=settings.get("lang_code", "en"),
         )
 
-    if settings.get("translate") and st.session_state.get("translation_engine_used"):
+    engine_used_val = st.session_state.get("translation_engine_used", "")
+    if (settings.get("translate")
+            and engine_used_val
+            and "original" not in engine_used_val
+            and settings.get("target_lang") != settings.get("lang_code")):
         UIComponents.render_translation_status(
             chapters_translated=len(chapters),
             total_chapters=len(chapters),
             source_lang=settings.get("lang_code", "en"),
             target_lang=settings.get("target_lang", "en"),
-            engine_used=st.session_state["translation_engine_used"],
+            engine_used=engine_used_val,
         )
 
     # Page range extension banner
@@ -583,15 +613,17 @@ def _render_analysis_section(document_structure: dict, lang_code: str) -> None:
     reading_time = TextAnalyzer.get_reading_time_estimate(full_text)
 
     with st.spinner("Running document analysis…"):
-        keywords           = TextAnalyzer.extract_keywords(full_text, lang_code)
-        characters         = TextAnalyzer.detect_character_names(full_text, lang_code)
-        summary            = TextAnalyzer.summarize_text(full_text, lang_code)
-        sentiment          = TextAnalyzer.sentiment_analysis(full_text, lang_code)
-        readability        = TextAnalyzer.compute_readability(full_text)
-        text_stats         = TextAnalyzer.compute_text_stats(full_text, chapters)
-        content_type       = TextAnalyzer.detect_content_type(full_text, chapters)
-        topic_density      = TextAnalyzer.compute_topic_density(full_text, keywords)
-        chapter_complexity = TextAnalyzer.detect_language_complexity_by_chapter(chapters)
+        keywords             = TextAnalyzer.extract_keywords(full_text, lang_code)
+        characters           = TextAnalyzer.detect_character_names(full_text, lang_code)
+        summary              = TextAnalyzer.summarize_text(full_text, lang_code)
+        sentiment            = TextAnalyzer.sentiment_analysis(full_text, lang_code)
+        readability          = TextAnalyzer.compute_readability(full_text)
+        text_stats           = TextAnalyzer.compute_text_stats(full_text, chapters)
+        content_type         = TextAnalyzer.detect_content_type(full_text, chapters)
+        topic_density        = TextAnalyzer.compute_topic_density(full_text, keywords)
+        chapter_complexity   = TextAnalyzer.detect_language_complexity_by_chapter(chapters)
+        lexical_diversity    = TextAnalyzer.compute_lexical_diversity(full_text)
+        sentence_complexity  = TextAnalyzer.compute_sentence_complexity(full_text)
 
     UIComponents.render_analysis_panel(
         keywords=keywords,
@@ -605,6 +637,8 @@ def _render_analysis_section(document_structure: dict, lang_code: str) -> None:
         content_type=content_type,
         topic_density=topic_density,
         chapter_complexity=chapter_complexity,
+        lexical_diversity=lexical_diversity,
+        sentence_complexity=sentence_complexity,
     )
 
 

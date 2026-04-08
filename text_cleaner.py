@@ -505,12 +505,27 @@ class TextCleaner:
             if len(text) > Config.MAX_HEADING_CHARS:
                 continue
 
-            # Reject blocks that are only digits (escaped page numbers)
-            if re.fullmatch(r"[\d\s]+", text):
+            # Reject blocks that are only digits or punctuation
+            if re.fullmatch(r"[\d\s\.\-\_\|]+", text):
+                continue
+            if re.fullmatch(r"[^\w]+", text):
                 continue
 
-            # Reject blocks that are only punctuation/symbols
-            if re.fullmatch(r"[^\w]+", text):
+            # Must have minimum word count to be a real heading
+            word_count = len(text.split())
+            if word_count < getattr(Config, "HEADING_MIN_WORDS", 2):
+                continue
+
+            # Reject figure/table/equation labels
+            if re.match(r"^(FIGURA|FIGURE|TABLA|TABLE|ECUACI|EQUATION|FIG\.?\s*\d|TAB\.?\s*\d)", text, re.IGNORECASE):
+                continue
+
+            # Reject footnote-style text (starts with number + text, short)
+            if re.match(r"^\d{1,2}\s+[A-Za-z]", text) and len(text) < 60:
+                continue
+
+            # Reject byline/source patterns
+            if re.search(r"\|\s|Fuente:|Source:", text):
                 continue
 
             # Determine heading level by relative size

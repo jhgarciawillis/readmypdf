@@ -56,9 +56,15 @@ class Config:
     # HEADING DETECTION                                                    #
     # ------------------------------------------------------------------ #
 
-    HEADING_SIZE_RATIO: float = 1.2
-    MIN_HEADING_CHARS:  int   = 3
-    MAX_HEADING_CHARS:  int   = 200
+    # Heading detection — stricter thresholds prevent figure labels,
+    # section numbers, and caption fragments from being treated as headings.
+    # HEADING_SIZE_RATIO: how much larger than body text a span must be.
+    # MIN_HEADING_CHARS: minimum characters — filters "1.", "Fig", etc.
+    # MAX_HEADING_CHARS: maximum characters — filters run-on text.
+    HEADING_MIN_WORDS:   int   = 2
+    HEADING_SIZE_RATIO: float = 1.35
+    MIN_HEADING_CHARS:  int   = 10
+    MAX_HEADING_CHARS:  int   = 120
 
     # ------------------------------------------------------------------ #
     # TEXT CLEANING                                                        #

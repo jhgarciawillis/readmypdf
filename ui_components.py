@@ -184,6 +184,10 @@ class UIComponents:
         effective_max = max(max_pages, 1)
         col1, col2   = st.columns(2)
 
+        # Use dynamic defaults from session state so the selector
+        # reflects the actual loaded PDF page count immediately
+        default_end = effective_max  # always default to all pages
+
         with col1:
             start_page = st.number_input(
                 "From page",
@@ -198,16 +202,19 @@ class UIComponents:
                 "To page",
                 min_value=1,
                 max_value=effective_max,
-                value=effective_max,
+                value=default_end,
                 step=1,
-                help="Last page to process (1-indexed, inclusive).",
+                help=(
+                    f"Last page to process. PDF has {effective_max} pages. "
+                    "Auto-extends if a chapter boundary is detected mid-range."
+                ),
             )
 
         if effective_max > 1:
+            selected = int(end_page) - int(start_page) + 1
             st.caption(
-                f"PDF: {effective_max} pages total. "
-                f"Selected: {int(end_page) - int(start_page) + 1} pages. "
-                f"Chapter boundary detection will auto-extend if a chapter is cut."
+                f"{effective_max} pages total · {selected} selected "
+                + ("· Full document" if selected == effective_max else f"· Pages {int(start_page)}–{int(end_page)}")
             )
         return int(start_page), int(end_page)
 
@@ -860,17 +867,19 @@ class UIComponents:
 
     @staticmethod
     def render_analysis_panel(
-        keywords:           list,
-        characters:         list,
-        summary:            str,
-        sentiment:          dict,
-        reading_time:       str,
-        word_count:         int,
-        readability:        dict  = None,
-        text_stats:         dict  = None,
-        content_type:       dict  = None,
-        topic_density:      list  = None,
-        chapter_complexity: list  = None,
+        keywords:             list,
+        characters:           list,
+        summary:              str,
+        sentiment:            dict,
+        reading_time:         str,
+        word_count:           int,
+        readability:          dict  = None,
+        text_stats:           dict  = None,
+        content_type:         dict  = None,
+        topic_density:        list  = None,
+        chapter_complexity:   list  = None,
+        lexical_diversity:    dict  = None,
+        sentence_complexity:  dict  = None,
     ) -> None:
         st.subheader("📊 Document Intelligence")
 
@@ -996,16 +1005,62 @@ class UIComponents:
                 st.markdown(f"{icon} **{short}** — {label} ({ease}/100) · {wc:,} words")
             st.divider()
 
-        # Row 6: entities
+        # Row 6: Lexical diversity (new KPI)
+        if lexical_diversity:
+            st.markdown("**🔤 Lexical Diversity**")
+            st.caption(
+                "MATTR (Moving Average Type-Token Ratio) is length-independent and more "
+                "reliable than simple vocabulary richness for longer documents."
+            )
+            ld1, ld2, ld3, ld4 = st.columns(4)
+            with ld1:
+                st.metric("MATTR", f"{lexical_diversity.get('mattr', 0)}%",
+                          help="Higher = more diverse vocabulary (length-independent)")
+            with ld2:
+                st.metric("Type-Token Ratio", f"{lexical_diversity.get('ttr', 0)}%")
+            with ld3:
+                st.metric("Hapax Words", f"{lexical_diversity.get('hapax_count', 0):,}",
+                          help="Words appearing exactly once — indicator of specialized vocabulary")
+            with ld4:
+                st.metric("Avg Word Frequency", f"{lexical_diversity.get('avg_word_frequency', 0)}×")
+            st.divider()
+
+        # Row 7: Sentence complexity (new KPI)
+        if sentence_complexity:
+            st.markdown("**📏 Sentence Complexity** *(audio comprehension impact)*")
+            long_pct = sentence_complexity.get("long_sentence_pct", 0)
+            long_n   = sentence_complexity.get("long_sentence_count", 0)
+            longest  = sentence_complexity.get("longest_sentence_words", 0)
+            sc_color = "🔴" if long_pct > 30 else ("🟡" if long_pct > 15 else "🟢")
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
+                st.metric(
+                    "Long Sentences (>30 words)",
+                    f"{long_n} ({long_pct}%)",
+                    help="Sentences over 30 words are difficult to follow while listening"
+                )
+            with sc2:
+                st.metric("Longest Sentence", f"{longest} words")
+            with sc3:
+                st.metric("Short Fragments (<5 words)",
+                          f"{sentence_complexity.get('short_sentence_count', 0)}")
+            if long_pct > 20:
+                st.caption(
+                    f"{sc_color} {long_pct}% of sentences are long (>30 words). "
+                    "Consider using a slower playback speed for complex sections."
+                )
+            st.divider()
+
+        # Row 8: entities
         if characters:
             st.markdown("**👥 Recurring Names / Entities**")
             st.write("  •  ".join(characters[:20]))
             st.divider()
 
-        # Row 7: keywords
+        # Row 9: keywords
         if keywords:
             st.markdown("**💬 Top Keywords**")
-            kw_parts = [f"**{w}** ({c})" for w, c in keywords[:15]]
+            kw_parts = [f"**{w}** ({ct})" for w, ct in keywords[:15]]
             st.write("  •  ".join(kw_parts))
 
     # ================================================================== #

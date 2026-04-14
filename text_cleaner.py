@@ -482,11 +482,42 @@ class TextCleaner:
         median_size = statistics.median(font_sizes)
         ratio = Config.HEADING_SIZE_RATIO
 
+        # Detect cover pages: pages where almost all text is at heading-level font.
+        # On cover pages, decorative title elements should not become chapter headings.
+        # A page is considered a cover page if >= 70% of its text spans are at
+        # heading-level font size AND total non-heading spans are fewer than 5.
+        page_span_counts: dict[int, dict] = {}
+        for block in blocks:
+            pn = block.get("page_num", 0)
+            fs = block.get("font_size", 0.0)
+            if pn not in page_span_counts:
+                page_span_counts[pn] = {"large": 0, "body": 0}
+            if fs >= median_size * ratio:
+                page_span_counts[pn]["large"] += 1
+            else:
+                page_span_counts[pn]["body"] += 1
+
+        cover_pages: set[int] = set()
+        for pn, counts in page_span_counts.items():
+            total = counts["large"] + counts["body"]
+            if total > 0:
+                large_pct = counts["large"] / total
+                if large_pct >= 0.70 and counts["body"] < 5:
+                    cover_pages.add(pn)
+                    logger.debug(
+                        f"Page {pn+1} identified as cover page "
+                        f"(large_pct={large_pct:.0%}, body_spans={counts['body']})"
+                    )
+
         headings = []
         for block in blocks:
             text = block.get("text", "").strip()
             font_size = block.get("font_size", 0.0)
             page_num = block.get("page_num", 0)
+
+            # Skip blocks on cover pages — decorative title elements
+            if page_num in cover_pages:
+                continue
 
             # Must be large enough to be a heading
             if font_size < median_size * ratio:

@@ -248,11 +248,8 @@ class TextCleaner:
         ):
             return True
 
-        # Standalone integer (page number on its own)
-        if re.fullmatch(r"\d{1,4}", t):
-            return True
-
-        # "- 3 -" or "— 3 —" style page numbers
+        # "- 3 -" or "— 3 —" style page numbers (not standalone digits —
+        # single digits like "0" and "1" are legitimate table cell values)
         if re.fullmatch(r"[-—–]\s*\d{1,4}\s*[-—–]", t):
             return True
 
@@ -269,13 +266,9 @@ class TextCleaner:
             return True
 
         # Pipe-separated byline pattern: "Author Name | Publication Name"
-        # Common in academic/professional PDFs as running headers
-        if re.fullmatch(r"[A-Za-zÀ-ÿ\s\.\,]+\|[A-Za-zÀ-ÿ\s\.\,]+", t):
-            return True
-
-        # Short text that is only uppercase — likely a section stamp or label
-        # e.g. "CONFIDENTIAL", "DRAFT", "APPENDIX A"
-        if len(t) <= 30 and t == t.upper() and re.search(r"[A-Z]", t):
+        # Requires at least 5 chars on each side of the pipe to avoid
+        # catching math expressions like "P | X" or "/1 − P"
+        if re.fullmatch(r"[A-Za-zÀ-ÿ\s\.\,]{5,}\|[A-Za-zÀ-ÿ\s\.\,]{5,}", t):
             return True
 
         return False

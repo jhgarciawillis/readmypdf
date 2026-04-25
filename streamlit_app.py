@@ -204,6 +204,11 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
 
     blocks    = extraction_result["blocks"]
     mode_used = extraction_result["mode_used"]
+    logger.info(f"[STAGE 4] Extraction complete: {len(blocks)} blocks, mode={mode_used}")
+    if blocks:
+        pages_with_blocks = len(set(b.get("page_num",0) for b in blocks))
+        font_sizes = sorted(set(round(b.get("font_size",0),1) for b in blocks if b.get("font_size",0)>0))
+        logger.info(f"[STAGE 4] Pages with blocks: {pages_with_blocks}, font sizes: {font_sizes}")
 
     if not blocks:
         UIComponents.render_error(
@@ -221,8 +226,9 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
         )
         detected_lang = Translator.detect_language(sample_text)
         st.session_state.detected_lang = detected_lang
+        logger.info(f"[STAGE 5] Auto-detected language: '{detected_lang}', sidebar was: '{lang_code}'")
         if detected_lang != lang_code:
-            logger.info(f"Auto-detected language '{detected_lang}' — overriding '{lang_code}'")
+            logger.info(f"[STAGE 5] Overriding lang_code: '{lang_code}' → '{detected_lang}'")
             lang_code = detected_lang
 
     # ------------------------------------------------------------------ #
@@ -241,6 +247,9 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
             return
 
     chapters = document_structure["chapters"]
+    logger.info(f"[STAGE 6] Chapters built: {len(chapters)}")
+    for ch_title, ch_text in chapters.items():
+        logger.info(f"[STAGE 6]   '{ch_title[:60]}': {len(ch_text.split())} words, {len(ch_text)} chars")
 
     if not chapters:
         UIComponents.render_error(
@@ -271,6 +280,7 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
                 if not ch_text.strip():
                     translated[ch_title] = ch_text
                     continue
+                logger.info(f"[STAGE 7] Translating '{ch_title[:50]}': {len(ch_text)} chars, {len(ch_text.split())} words")
                 try:
                     result_text, engine_used = Translator.translate_with_fallback(
                         text=ch_text,
@@ -278,22 +288,36 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
                         target_lang=target_lang,
                         config=trans_config,
                     )
+                    logger.info(f"[STAGE 7]   Result: {len(result_text.split())} words via {engine_used}")
+                    if len(result_text.strip()) < 10:
+                        logger.error(f"[STAGE 7]   CRITICAL: Translation returned nearly empty result! Keeping original.")
+                        result_text = ch_text
                     translated[ch_title] = result_text
                 except Exception as e:
-                    logger.error(f"Translation failed for '{ch_title}': {e}")
+                    logger.warning(f"[STAGE 7] Translation failed for '{ch_title}': {e} — keeping original")
                     translated[ch_title] = ch_text
 
             chapters                               = translated
             document_structure["chapters"]         = chapters
-            lang_code                              = target_lang
             st.session_state.translation_engine_used = engine_used
-            logger.info(f"Translation complete via {engine_used}: {src_label} → {tgt_label}")
+
+            # Only switch lang_code to target if translation actually succeeded
+            # (not "original" which means it failed or returned unchanged text)
+            if "original" not in engine_used:
+                lang_code = target_lang
+                logger.info(f"Translation complete via {engine_used}: {src_label} → {tgt_label}")
+            else:
+                logger.warning(
+                    f"Translation returned original text ({src_label} → {tgt_label}). "
+                    f"Keeping lang_code={lang_code} for audio generation."
+                )
 
     # ------------------------------------------------------------------ #
     # STAGE 8: Compute page ranges                                         #
     # ------------------------------------------------------------------ #
     page_ranges = TextAnalyzer.get_page_range_per_chapter(blocks, chapters)
     st.session_state.page_ranges = page_ranges
+    logger.info(f"[STAGE 8] Page ranges: {page_ranges}")
 
     # ------------------------------------------------------------------ #
     # STAGE 9: Post-hoc incomplete page detection and removal              #
@@ -303,8 +327,10 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
 
     if remove_incomplete_pages:
         with st.spinner("Verifying page completeness via word fingerprinting…"):
+            logger.info(f"[STAGE 9] Running incomplete page detection on {len(chapters)} chapters...")
             incomplete_pages = TextAnalyzer.flag_incomplete_pages(blocks, chapters)
             st.session_state.incomplete_pages = incomplete_pages
+            logger.info(f"[STAGE 9] Incomplete pages flagged: {[p+1 for p in sorted(incomplete_pages)]}")
 
             if incomplete_pages:
                 # Only remove incomplete pages if we won't lose most content
@@ -314,8 +340,9 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
                     # More than 50% of pages flagged = fingerprint unreliable
                     # (likely single-chapter doc where last page = last page of doc)
                     logger.warning(
-                        f"Incomplete page detection flagged {pct_flagged:.0%} of pages — "
-                        f"likely false positives in a single-chapter document. Skipping removal."
+                        f"[STAGE 9] SAFETY: {pct_flagged:.0%} of pages flagged "
+                        f"({len(incomplete_pages)}/{total_pages_in_blocks}) — "
+                        f"likely false positives. Skipping removal to preserve content."
                     )
                     st.session_state.incomplete_pages = set()
                     incomplete_pages = set()
@@ -332,13 +359,17 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
                     # Safety: only use rebuilt if it has substantial content
                     rebuilt_text = " ".join(rebuilt["chapters"].values())
                     original_text = " ".join(chapters.values())
+                    pct_kept = len(rebuilt_text) / max(len(original_text), 1)
+                    logger.info(f"[STAGE 9] Rebuild: original={len(original_text.split())} words, rebuilt={len(rebuilt_text.split())} words ({pct_kept:.0%} kept)")
                     if len(rebuilt_text) > len(original_text) * 0.3:
                         chapters                       = rebuilt["chapters"]
                         document_structure["chapters"] = chapters
-                        logger.info(f"Removed content from {len(incomplete_pages)} incomplete pages.")
+                        logger.info(f"[STAGE 9] Removed content from {len(incomplete_pages)} incomplete pages. New chapters: {len(chapters)}")
+                        for t, tx in chapters.items():
+                            logger.info(f"[STAGE 9]   '{t[:50]}': {len(tx.split())} words")
                     else:
                         logger.warning(
-                            "Incomplete page removal would lose >70% of content — skipping."
+                            f"[STAGE 9] SAFETY: Rebuild would lose {1-pct_kept:.0%} of content — skipping removal."
                         )
                         st.session_state.incomplete_pages = set()
                         incomplete_pages = set()
@@ -348,8 +379,10 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
     # ------------------------------------------------------------------ #
     if remove_incomplete_chapters:
         with st.spinner("Verifying chapter completeness…"):
+            logger.info(f"[STAGE 10] Running incomplete chapter detection...")
             incomplete_chapters = TextAnalyzer.flag_incomplete_chapters(blocks, chapters)
             st.session_state.incomplete_chapters = incomplete_chapters
+            logger.info(f"[STAGE 10] Incomplete chapters flagged: {list(incomplete_chapters)}")
 
             if incomplete_chapters:
                 # Only remove if it won't wipe everything
@@ -383,6 +416,10 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
     audio_data:     dict[str, bytes] = {}
     chapter_titles = list(chapters.keys())
     total_chapters = len(chapter_titles)
+    total_words = sum(len(t.split()) for t in chapters.values())
+    logger.info(f"[STAGE 11] Starting audio generation: {total_chapters} chapters, {total_words} total words, lang={lang_code}, engine={tts_engine}")
+    for t, tx in chapters.items():
+        logger.info(f"[STAGE 11]   '{t[:50]}': {len(tx.split())} words")
 
     # Initialise chapter_status for all chapters
     chapter_status: dict[str, str] = {

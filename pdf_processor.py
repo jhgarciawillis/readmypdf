@@ -123,8 +123,40 @@ class PDFProcessor:
             median_size = statistics.median(all_sizes)
             threshold   = median_size * Config.HEADING_SIZE_RATIO
 
-            # Pass 2: collect spans above threshold
+            # Pass 1b: detect cover pages (pages where ≥70% of spans are large font)
+            # Cover pages have decorative title text that should not be chapter headings
+            page_large: dict[int, int] = {}
+            page_body:  dict[int, int] = {}
             for page_num in range(len(doc)):
+                page      = doc[page_num]
+                page_dict = page.get_text("dict")
+                for block in page_dict.get("blocks", []):
+                    if block.get("type") != 0:
+                        continue
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            text = span.get("text", "").strip()
+                            size = span.get("size", 0.0)
+                            if not text:
+                                continue
+                            if size >= threshold:
+                                page_large[page_num] = page_large.get(page_num, 0) + 1
+                            else:
+                                page_body[page_num] = page_body.get(page_num, 0) + 1
+
+            cover_pages: set[int] = set()
+            for pn in range(len(doc)):
+                large = page_large.get(pn, 0)
+                body  = page_body.get(pn, 0)
+                total = large + body
+                if total > 0 and large / total >= 0.70 and body < 5:
+                    cover_pages.add(pn)
+                    logger.debug(f"Pre-scan: page {pn+1} identified as cover page")
+
+            # Pass 2: collect spans above threshold (excluding cover pages)
+            for page_num in range(len(doc)):
+                if page_num in cover_pages:
+                    continue
                 page      = doc[page_num]
                 page_dict = page.get_text("dict")
                 for block in page_dict.get("blocks", []):
@@ -137,6 +169,7 @@ class PDFProcessor:
                             if (
                                 font_size >= threshold
                                 and Config.MIN_HEADING_CHARS <= len(text) <= Config.MAX_HEADING_CHARS
+                                and len(text.split()) >= getattr(Config, "HEADING_MIN_WORDS", 2)
                             ):
                                 heading_candidates.append({
                                     "text":      text,

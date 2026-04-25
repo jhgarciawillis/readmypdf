@@ -128,6 +128,19 @@ def _translate_google(
         if not translated or not translated.strip():
             raise RuntimeError("Google Translate returned empty result")
 
+        # Detect silent failure: if result is identical to input AND
+        # source and target languages differ, translation likely failed
+        # (googletrans sometimes returns original text when network is unreliable)
+        if (translated.strip() == text.strip()
+                and source_lang != target_lang
+                and source_lang not in ("auto", "")
+                and len(text) > 20):
+            raise RuntimeError(
+                f"Google Translate returned original text unchanged "
+                f"({source_lang}→{target_lang}) — likely a network detection failure. "
+                "This often happens when Google misidentifies the source language."
+            )
+
         return translated
 
     except ImportError:

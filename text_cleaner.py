@@ -303,35 +303,55 @@ class TextCleaner:
     @staticmethod
     def get_page_fingerprint(page_blocks: list[dict], n_words: int = None) -> str:
         """
-        Extract the last N words from the last content block on a page.
-        Used to verify page completeness — if these words appear in the
-        assembled chapter text, the page was fully captured.
+        Extract the last N prose words from the last non-URL content block.
 
-        Args:
-          page_blocks: list of block dicts for a single page
-          n_words:     number of words to use (default: Config.LAST_WORDS_FINGERPRINT_COUNT)
+        Skips blocks that are primarily URLs, reference citations, or
+        numeric-only content — these are often not present verbatim in
+        the assembled chapter text due to TTS cleaning and are unreliable
+        as fingerprints.
 
-        Returns:
-          Lowercase string of the last N words, space-joined.
-          Empty string if no content blocks found.
+        Falls back through blocks from bottom to top until finding a
+        block with enough prose words, or returns empty string.
         """
         import re
         if n_words is None:
             n_words = Config.LAST_WORDS_FINGERPRINT_COUNT
 
-        last_block = TextCleaner.get_last_content_block(page_blocks)
-        if not last_block:
+        # Get content blocks sorted by vertical position (bottom to top)
+        content_blocks = [
+            b for b in page_blocks
+            if b.get("text", "").strip()
+            and not TextCleaner.is_noise_pattern(b.get("text", "").strip())
+        ]
+        if not content_blocks:
             return ""
 
-        text  = last_block.get("text", "").strip()
-        words = re.findall(r"[a-zA-ZÀ-ÿ]+", text)  # letters only, handles accents
+        # Sort descending by y1 (bottom of page first)
+        content_blocks_sorted = sorted(content_blocks, key=lambda b: -b.get("y1", 0))
 
-        if not words:
-            return ""
+        for block in content_blocks_sorted:
+            text = block.get("text", "").strip()
 
-        # Take last n_words, lowercase for comparison
-        fingerprint = " ".join(words[-n_words:]).lower()
-        return fingerprint
+            # Skip blocks that contain URLs — the URL fragment gets extracted
+            # as the fingerprint and won't be found in the assembled prose text
+            # (URLs are stripped during TTS cleaning)
+            if re.search(r"https?://\S+", text) or re.search(r"www\.\S+", text):
+                continue
+            # Skip blocks that are mostly punctuation/numbers/slashes (URLs split across lines)
+            letter_count = len(re.findall(r"[a-zA-ZÀ-ÿ]", text))
+            total_count  = len(text.replace(" ", ""))
+            if total_count > 0 and letter_count / total_count < 0.5:
+                continue
+            # Skip very short blocks (less than 3 real words)
+            words = re.findall(r"[a-zA-ZÀ-ÿ]{3,}", text)
+            if len(words) < 3:
+                continue
+
+            # This block has real prose content — use it as fingerprint
+            fingerprint = " ".join(words[-n_words:]).lower()
+            return fingerprint
+
+        return ""
 
     @staticmethod
     def fingerprint_in_text(fingerprint: str, text: str) -> bool:
@@ -339,16 +359,17 @@ class TextCleaner:
         Check whether a page fingerprint (last N words) appears in
         the assembled chapter text.
 
-        Comparison is case-insensitive and ignores punctuation between words
-        so "said Holmes" matches "said Holmes." or "said  Holmes".
+        Uses a loose pattern that allows any characters (not just whitespace)
+        between fingerprint words — up to 60 chars between each word.
+        This handles cases where reference entries have author initials,
+        dates, or punctuation between the key words.
 
-        Args:
-          fingerprint: string from get_page_fingerprint()
-          text:        assembled chapter text to search within
+        Example: fingerprint "watson introducción econometría madrid pearson"
+        matches "Watson, M. (2012). Introducción a la econometría. Madrid: Pearson"
+        even though the words are separated by punctuation and other text.
 
-        Returns:
-          True if the fingerprint words appear consecutively in text.
-          False if fingerprint is empty or not found.
+        Returns True if fingerprint is too short (assume complete).
+        Returns False if fingerprint is empty or not found.
         """
         import re
         if not fingerprint or not text:
@@ -356,12 +377,12 @@ class TextCleaner:
 
         fp_words = fingerprint.lower().split()
         if len(fp_words) < Config.FINGERPRINT_MIN_WORDS:
-            # Fingerprint too short — unreliable, assume complete
             return True
 
-        # Build a regex that matches the words with any punctuation/whitespace
-        # between them: "said holmes" matches "said, Holmes" or "said Holmes."
-        pattern = r"\s*".join(re.escape(w) for w in fp_words)
+        # Allow up to 60 arbitrary characters between fingerprint words.
+        # This matches words that appear near each other even with punctuation,
+        # dates, or other text between them (common in reference citations).
+        pattern = r"[\s\S]{0,60}?".join(re.escape(w) for w in fp_words)
         return bool(re.search(pattern, text.lower()))
 
     @staticmethod

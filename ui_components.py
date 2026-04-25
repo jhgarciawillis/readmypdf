@@ -184,9 +184,19 @@ class UIComponents:
         effective_max = max(max_pages, 1)
         col1, col2   = st.columns(2)
 
-        # Use dynamic defaults from session state so the selector
-        # reflects the actual loaded PDF page count immediately
-        default_end = effective_max  # always default to all pages
+        # Persist the correct end-page default in session state so that
+        # when the sidebar re-renders with the real page count, the
+        # "To page" field shows the last page — not 1.
+        # Streamlit clamps number_input value to [min, max] on first render,
+        # so if max_pages=1 initially, value would be clamped to 1.
+        # Using session state bypasses this.
+        ss_key = "page_range_end_default"
+        if effective_max > 1:
+            # Update session state whenever we have a real page count
+            st.session_state[ss_key] = effective_max
+        stored_default = st.session_state.get(ss_key, effective_max)
+        # Clamp stored default to current valid range
+        default_end = min(max(stored_default, 1), effective_max)
 
         with col1:
             start_page = st.number_input(
@@ -310,8 +320,21 @@ class UIComponents:
         )
         target_lang = lang_codes[lang_labels.index(selected_label)]
 
-        if target_lang == source_lang:
-            st.caption("Source and target are the same — no translation will run.")
+        # Check against auto-detected language too (auto-detect overrides sidebar)
+        effective_source = st.session_state.get("detected_lang", source_lang) or source_lang
+        if target_lang == effective_source:
+            detected_label = Config.SUPPORTED_LANGUAGES.get(effective_source, {}).get("label", effective_source)
+            target_label   = Config.SUPPORTED_LANGUAGES.get(target_lang, {}).get("label", target_lang)
+            st.caption(
+                f"Source ({detected_label}) and target ({target_label}) are the same "
+                f"— no translation will run."
+            )
+        elif effective_source != source_lang:
+            detected_label = Config.SUPPORTED_LANGUAGES.get(effective_source, {}).get("label", effective_source)
+            st.caption(
+                f"Source auto-detected as {detected_label}. "
+                f"Translation will run after language detection."
+            )
 
         st.markdown("**Engine status:**")
         g_icon = "🟢" if Config.is_google_translate_available() else "🔴"

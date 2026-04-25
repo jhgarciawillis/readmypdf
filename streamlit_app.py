@@ -1,853 +1,1132 @@
 """
-streamlit_app.py
+ui_components.py
 ================
-Entry point and pipeline orchestrator.
-
-Pipeline stages:
-  1.  Validate PDF
-  2.  Detect extraction mode (text vs OCR)
-  3.  PRE-SCAN full PDF for chapter boundaries (prevention layer)
-  4.  Apply chapter-aware page range (auto-extend if cutting a chapter)
-  5.  Show pre-processing summary to user
-  6.  Extract blocks from final page range
-  7.  Auto-detect language
-  8.  Build document structure (chapters, headings)
-  9.  Translate chapters if requested
-  10. Compute page ranges per chapter
-  11. Post-hoc: flag and remove incomplete pages (fingerprint verification)
-  12. Post-hoc: flag and remove incomplete chapters if user opted in
-  13. Generate audio per chapter (live queue with per-chapter status)
-  14. Store all results in session state
+All Streamlit UI rendering. Pure presentation layer.
+Contains zero business logic — takes pre-computed data and renders it.
 """
 
+import os
+import io
+import re
+import base64
 import logging
-import traceback
 from collections import OrderedDict
+from typing import Optional
 
 import streamlit as st
 
 from config import Config
-from text_cleaner import TextCleaner
-import translator as Translator
-from pdf_processor import PDFProcessor
-from text_analyzer import TextAnalyzer
-from audio_generator import AudioGenerator
-from ui_components import UIComponents
 
-logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
-    format=Config.LOG_FORMAT,
-)
 logger = logging.getLogger(__name__)
 
 
-# ================================================================== #
-# SESSION STATE                                                        #
-# ================================================================== #
+class UIComponents:
 
-def initialize_session_state() -> None:
-    defaults = {
-        "pdf_bytes":               None,
-        "audio_data":              {},
-        "document_structure":      None,
-        "extraction_result":       None,
-        "current_chapter":         None,
-        "bookmarks":               [],
-        "processing_done":         False,
-        "settings":                {},
-        "detected_lang":           None,
-        "translation_engine_used": None,
-        "chapter_status":          {},
-        "page_ranges":             {},
-        "incomplete_pages":        set(),
-        "incomplete_chapters":     set(),
-        "pre_scan_warnings":       [],
-        "original_end_page":       None,
-        "extended_end_page":       None,
-        "chapters_found_prescan":  [],
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+    # ================================================================== #
+    # SECTION 1 — FILE INPUT                                              #
+    # ================================================================== #
 
-
-def _reset_pipeline_state() -> None:
-    """Reset all pipeline outputs before a new run."""
-    st.session_state.processing_done         = False
-    st.session_state.audio_data              = {}
-    st.session_state.document_structure      = None
-    st.session_state.extraction_result       = None
-    st.session_state.current_chapter         = None
-    st.session_state.bookmarks               = []
-    st.session_state.detected_lang           = None
-    st.session_state.translation_engine_used = None
-    st.session_state.chapter_status          = {}
-    st.session_state.page_ranges             = {}
-    st.session_state.incomplete_pages        = set()
-    st.session_state.incomplete_chapters     = set()
-    st.session_state.pre_scan_warnings       = []
-    st.session_state.original_end_page       = None
-    st.session_state.extended_end_page       = None
-
-
-# ================================================================== #
-# PIPELINE                                                             #
-# ================================================================== #
-
-def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
-    """
-    Full PDF → Audio pipeline. All results stored in session state.
-    """
-    lang_code                  = settings["lang_code"]
-    tts_engine                 = settings["tts_engine"]
-    rate                       = settings["rate"]
-    pitch                      = settings["pitch"]
-    start_page                 = settings["start_page"]
-    end_page                   = settings["end_page"]
-    remove_hf                  = settings["remove_headers_footers"]
-    remove_incomplete_pages    = settings.get("remove_incomplete_pages",    True)
-    remove_incomplete_chapters = settings.get("remove_incomplete_chapters", False)
-    translate                  = settings.get("translate",           False)
-    target_lang                = settings.get("target_lang",         lang_code)
-    translation_engine         = settings.get("translation_engine",  "auto")
-
-    # ------------------------------------------------------------------ #
-    # STAGE 1: Validate                                                    #
-    # ------------------------------------------------------------------ #
-    with st.spinner("Validating PDF…"):
-        valid, err = PDFProcessor.validate_pdf(pdf_bytes)
-        if not valid:
-            UIComponents.render_error(err)
-            return
-
-    # ------------------------------------------------------------------ #
-    # STAGE 2: Detect extraction mode                                      #
-    # ------------------------------------------------------------------ #
-    with st.spinner("Analysing PDF structure…"):
-        configured_mode = Config.validate_extraction_mode()
-        detected_mode   = TextCleaner.detect_pdf_mode(pdf_bytes) if configured_mode == "auto" else configured_mode
-        logger.info(f"Extraction mode: {detected_mode}")
-
-    page_count   = PDFProcessor.get_page_count(pdf_bytes)
-    resolved_end = end_page if end_page > 1 else page_count
-
-    # ------------------------------------------------------------------ #
-    # STAGE 3: Pre-scan for chapter boundaries (prevention)               #
-    # ------------------------------------------------------------------ #
-    with st.spinner("Scanning document structure for chapter boundaries…"):
-        heading_pages = PDFProcessor.get_heading_pages(pdf_bytes)
-
-        recommended_end, warnings = TextAnalyzer.get_chapter_aware_page_range(
-            heading_pages=heading_pages,
-            requested_start=start_page,
-            requested_end=resolved_end,
-            total_pages=page_count,
+    @staticmethod
+    def file_uploader_widget() -> Optional[object]:
+        return st.file_uploader(
+            "Upload a PDF file",
+            type=["pdf"],
+            help=(
+                f"Maximum file size: {Config.MAX_PDF_SIZE_MB} MB. "
+                "Text-based PDFs process in seconds; "
+                "scanned PDFs require OCR and take longer."
+            ),
+            label_visibility="collapsed",
         )
 
-        st.session_state.pre_scan_warnings      = warnings
-        st.session_state.original_end_page      = resolved_end
-        st.session_state.extended_end_page      = recommended_end
-        st.session_state.chapters_found_prescan = []
+    @staticmethod
+    def local_file_selector(folder_path: str = ".") -> Optional[str]:
+        try:
+            pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith(".pdf")]
+        except OSError:
+            st.warning(f"Cannot read folder: {folder_path}")
+            return None
 
-        # Build chapter list from pre-scan for the summary panel
-        if heading_pages:
-            from collections import defaultdict as _dd
-            seen: dict = {}
-            for h in sorted(heading_pages, key=lambda x: x["page_num"]):
-                pn = h["page_num"]
-                if pn not in seen or h["font_size"] > seen[pn]["font_size"]:
-                    seen[pn] = h
-            unique = sorted(seen.values(), key=lambda x: x["page_num"])
-            for i, h in enumerate(unique):
-                ch_start = h["page_num"] + 1
-                ch_end   = unique[i + 1]["page_num"] if i + 1 < len(unique) else page_count
-                st.session_state.chapters_found_prescan.append({
-                    "title": h["text"],
-                    "start": ch_start,
-                    "end":   ch_end,
-                })
+        if not pdf_files:
+            st.info("No PDF files found in the current folder.")
+            return None
 
+        selected = st.selectbox("Select a PDF file", options=pdf_files, label_visibility="collapsed")
+        return os.path.join(folder_path, selected)
+
+    # ================================================================== #
+    # SECTION 2 — SETTINGS SIDEBAR                                        #
+    # ================================================================== #
+
+    @staticmethod
+    def render_sidebar_settings(max_pages: int = 1) -> dict:
+        """
+        Render all sidebar settings. Returns complete settings dict.
+        """
+        with st.sidebar:
+            st.title(Config.APP_NAME)
+            st.caption(f"v{Config.VERSION}")
+            st.divider()
+
+            st.subheader("Language")
+            lang_code = UIComponents._language_selector()
+            st.divider()
+
+            if Config.is_translation_available():
+                st.subheader("🌐 Translation")
+                translate, target_lang, trans_engine = UIComponents._translation_settings(lang_code)
+                st.divider()
+            else:
+                translate, target_lang, trans_engine = False, lang_code, "none"
+
+            st.subheader("TTS Engine")
+            tts_engine = UIComponents._tts_engine_selector()
+            st.divider()
+
+            st.subheader("Audio Settings")
+            rate, pitch = UIComponents._rate_pitch_sliders()
+            st.divider()
+
+            st.subheader("Page Range")
+            start_page, end_page = UIComponents._page_range_selector(max_pages)
+            st.divider()
+
+            st.subheader("Options")
+            remove_hf, show_analysis, remove_inc_pages, remove_inc_chapters = UIComponents._feature_toggles()
+
+        return {
+            "lang_code":                   lang_code,
+            "tts_engine":                  tts_engine,
+            "rate":                        rate,
+            "pitch":                       pitch,
+            "start_page":                  start_page,
+            "end_page":                    end_page,
+            "remove_headers_footers":      remove_hf,
+            "show_analysis":               show_analysis,
+            "translate":                   translate,
+            "target_lang":                 target_lang,
+            "translation_engine":          trans_engine,
+            "remove_incomplete_pages":     remove_inc_pages,
+            "remove_incomplete_chapters":  remove_inc_chapters,
+        }
+
+    @staticmethod
+    def _language_selector() -> str:
+        labels     = Config.get_all_language_labels()
+        label_list = list(labels.values())
+        code_list  = list(labels.keys())
+
+        # Reflect auto-detected language if set
+        default_idx = 0
+        if st.session_state.get("detected_lang"):
+            detected = st.session_state.detected_lang
+            if detected in code_list:
+                default_idx = code_list.index(detected)
+
+        selected_label = st.selectbox(
+            "Document language",
+            options=label_list,
+            index=default_idx,
+            help=(
+                "Language of the source PDF. Used for OCR accuracy and TTS voice. "
+                "Auto-detection will override this if enabled."
+            ),
+        )
+        return code_list[label_list.index(selected_label)]
+
+    @staticmethod
+    def _tts_engine_selector() -> str:
+        openai_available = Config.is_openai_available()
+
+        if openai_available:
+            options    = ["Free (gTTS)", "Premium (OpenAI)"]
+            engine_map = {"Free (gTTS)": "gtts", "Premium (OpenAI)": "openai"}
+            selected   = st.radio(
+                "TTS engine",
+                options=options,
+                index=0,
+                help=(
+                    "Free: Google Translate TTS — functional, no cost.\n\n"
+                    "Premium: OpenAI tts-1 — natural voice, ~$0.015/1,000 chars."
+                ),
+            )
+            return engine_map[selected]
+        else:
+            st.caption("🟢 Free (gTTS) — set OPENAI_API_KEY to unlock Premium")
+            return "gtts"
+
+    @staticmethod
+    def _rate_pitch_sliders() -> tuple[float, float]:
+        rate = st.slider(
+            "Speed",
+            min_value=0.5,
+            max_value=2.0,
+            value=Config.DEFAULT_RATE,
+            step=0.05,
+            help=(
+                "Playback speed. 1.0 = normal. "
+                "Below 0.8 uses gTTS slow mode natively. "
+                "Other values are applied via MP3 frame rate adjustment."
+            ),
+        )
+        pitch = st.slider(
+            "Pitch",
+            min_value=0.5,
+            max_value=2.0,
+            value=Config.DEFAULT_PITCH,
+            step=0.05,
+            help="Pitch adjustment. Currently informational — applied via OpenAI engine only.",
+        )
+        return rate, pitch
+
+    @staticmethod
+    def _page_range_selector(max_pages: int) -> tuple[int, int]:
+        effective_max = max(max_pages, 1)
+        col1, col2   = st.columns(2)
+
+        # Persist the correct end-page default in session state so that
+        # when the sidebar re-renders with the real page count, the
+        # "To page" field shows the last page — not 1.
+        # Streamlit clamps number_input value to [min, max] on first render,
+        # so if max_pages=1 initially, value would be clamped to 1.
+        # Using session state bypasses this.
+        ss_key = "page_range_end_default"
+        if effective_max > 1:
+            # Update session state whenever we have a real page count
+            st.session_state[ss_key] = effective_max
+        stored_default = st.session_state.get(ss_key, effective_max)
+        # Clamp stored default to current valid range
+        default_end = min(max(stored_default, 1), effective_max)
+
+        with col1:
+            start_page = st.number_input(
+                "From page",
+                min_value=1,
+                max_value=effective_max,
+                value=1,
+                step=1,
+                help="First page to process (1-indexed, inclusive).",
+            )
+        with col2:
+            end_page = st.number_input(
+                "To page",
+                min_value=1,
+                max_value=effective_max,
+                value=default_end,
+                step=1,
+                help=(
+                    f"Last page to process. PDF has {effective_max} pages. "
+                    "Auto-extends if a chapter boundary is detected mid-range."
+                ),
+            )
+
+        if effective_max > 1:
+            selected = int(end_page) - int(start_page) + 1
+            st.caption(
+                f"{effective_max} pages total · {selected} selected "
+                + ("· Full document" if selected == effective_max else f"· Pages {int(start_page)}–{int(end_page)}")
+            )
+        return int(start_page), int(end_page)
+
+    @staticmethod
+    def _feature_toggles() -> tuple:
+        """
+        Render feature toggle checkboxes.
+        Returns (remove_hf, show_analysis, remove_incomplete_pages, remove_incomplete_chapters)
+        """
+        remove_hf = st.checkbox(
+            "Remove headers & footers",
+            value=True,
+            help=(
+                "Detects and removes running headers, footers, and page numbers "
+                "before generating audio. Uses Y-band repetition detection and "
+                "noise pattern matching. Strongly recommended."
+            ),
+        )
+        show_analysis = st.checkbox(
+            "Show document analysis",
+            value=False,
+            help=(
+                "After processing, display a full Document Intelligence panel: "
+                "readability scores, vocabulary richness, topic density, "
+                "content type detection, chapter complexity ranking, "
+                "sentiment analysis, keyword frequency, and a summary."
+            ),
+        )
+
+        st.markdown("**Content completeness**")
+        st.caption(
+            "These options verify and enforce that only fully captured "
+            "pages and chapters are included in the audio output. "
+            "Verification uses word fingerprinting: the last few words "
+            "of each page are checked against the assembled text."
+        )
+
+        remove_incomplete_pages = st.checkbox(
+            "Remove incomplete pages",
+            value=True,
+            help=(
+                "For each chapter, the last page is verified by checking "
+                "whether its final words appear in the assembled chapter text. "
+                "If the fingerprint is not found, that page was cut off and "
+                "is removed from the audio. "
+                "Recommended ON — prevents audio cutting off mid-sentence."
+            ),
+        )
+        remove_incomplete_chapters = st.checkbox(
+            "Remove incomplete chapters",
+            value=False,
+            help=(
+                "If a chapter's last page fails fingerprint verification, "
+                "or the chapter text ends mid-word, the entire chapter is "
+                "excluded from the audio output. "
+                "More aggressive than page removal — off by default. "
+                "Enable if you want strictly complete chapters only."
+            ),
+        )
+
+        return remove_hf, show_analysis, remove_incomplete_pages, remove_incomplete_chapters
+
+    @staticmethod
+    def _translation_settings(source_lang: str) -> tuple:
+        """
+        Translation controls. Returns (translate, target_lang, engine).
+        """
+        translate = st.toggle(
+            "Translate output",
+            value=False,
+            help=(
+                "Translate extracted text to a different language before "
+                "generating audio. Translation runs after header/footer removal "
+                "and chapter splitting. Document analysis always runs on the "
+                "original source language."
+            ),
+        )
+
+        if not translate:
+            return False, source_lang, "auto"
+
+        trans_langs  = Config.TRANSLATION_SUPPORTED_LANGUAGES
+        lang_labels  = list(trans_langs.values())
+        lang_codes   = list(trans_langs.keys())
+
+        default_target = "en" if source_lang != "en" else "es"
+        default_idx    = lang_codes.index(default_target) if default_target in lang_codes else 0
+
+        selected_label = st.selectbox(
+            "Translate to",
+            options=lang_labels,
+            index=default_idx,
+        )
+        target_lang = lang_codes[lang_labels.index(selected_label)]
+
+        # Check against auto-detected language too (auto-detect overrides sidebar)
+        effective_source = st.session_state.get("detected_lang", source_lang) or source_lang
+        if target_lang == effective_source:
+            detected_label = Config.SUPPORTED_LANGUAGES.get(effective_source, {}).get("label", effective_source)
+            target_label   = Config.SUPPORTED_LANGUAGES.get(target_lang, {}).get("label", target_lang)
+            st.caption(
+                f"Source ({detected_label}) and target ({target_label}) are the same "
+                f"— no translation will run."
+            )
+        elif effective_source != source_lang:
+            detected_label = Config.SUPPORTED_LANGUAGES.get(effective_source, {}).get("label", effective_source)
+            st.caption(
+                f"Source auto-detected as {detected_label}. "
+                f"Translation will run after language detection."
+            )
+
+        st.markdown("**Engine status:**")
+        g_icon = "🟢" if Config.is_google_translate_available() else "🔴"
+        l_icon = "🟢" if Config.is_libretranslate_available()   else "🔴"
+        st.caption(f"{g_icon} Google Translate (free, unofficial API)")
+        st.caption(f"{l_icon} LibreTranslate ({Config.LIBRETRANSLATE_URL})")
+        st.caption("Rate limits: Google — no hard limit for occasional use. LibreTranslate public — ~80 requests/hour × 4,500 chars each = ~360,000 chars/hour (~25–40 articles/hour).")
+
+        engine_options = ["Auto (recommended)"]
+        if Config.is_google_translate_available():
+            engine_options.append("Google only")
+        if Config.is_libretranslate_available():
+            engine_options.append("LibreTranslate only")
+
+        selected_engine = st.radio(
+            "Engine preference",
+            options=engine_options,
+            index=0,
+            label_visibility="collapsed",
+        )
+
+        engine_map    = {
+            "Auto (recommended)": "auto",
+            "Google only":        "google",
+            "LibreTranslate only": "libretranslate",
+        }
+        return True, target_lang, engine_map.get(selected_engine, "auto")
+
+    # ================================================================== #
+    # SECTION 3 — STATUS BANNERS                                          #
+    # ================================================================== #
+
+    @staticmethod
+    def render_detected_language_banner(detected_lang: str, selected_lang: str) -> None:
+        if detected_lang == selected_lang:
+            return
+        detected_label = Config.SUPPORTED_LANGUAGES.get(detected_lang, {}).get("label", detected_lang)
+        selected_label = Config.SUPPORTED_LANGUAGES.get(selected_lang, {}).get("label", selected_lang)
+        st.info(
+            f"🔍 Auto-detected language: **{detected_label}**. "
+            f"Processing in {detected_label}. "
+            f"(Sidebar was set to {selected_label} — overridden automatically.)"
+        )
+
+    @staticmethod
+    def render_translation_status(
+        chapters_translated: int,
+        total_chapters:      int,
+        source_lang:         str,
+        target_lang:         str,
+        engine_used:         str,
+    ) -> None:
+        source_label = Config.SUPPORTED_LANGUAGES.get(source_lang, {}).get("label", source_lang)
+        target_label = Config.SUPPORTED_LANGUAGES.get(target_lang, {}).get("label", target_lang)
+        engine_names = {"google": "Google Translate", "libretranslate": "LibreTranslate"}
+        engine_name  = engine_names.get(engine_used, engine_used)
+
+        if "original" in engine_used:
+            # Translation failed silently or was skipped
+            st.warning(
+                f"⚠️ Translation requested ({source_label} → {target_label}) but "
+                f"both engines failed or returned unchanged text. "
+                f"Audio will be generated in the original language. "
+                f"Tip: try LibreTranslate or check your network connection."
+            )
+        else:
+            st.success(
+                f"🌐 Translated {chapters_translated}/{total_chapters} chapters — "
+                f"{source_label} → {target_label} via {engine_name}"
+            )
+
+    @staticmethod
+    def render_page_range_warning(
+        original_end:    int,
+        extended_end:    int,
+        chapters_cut:    list[dict],
+    ) -> None:
+        """
+        Show a banner explaining that the page range was auto-extended
+        because it would have cut through one or more chapters.
+
+        Args:
+          original_end:  the page the user originally requested
+          extended_end:  the page we extended to
+          chapters_cut:  list of warning dicts from get_chapter_aware_page_range
+        """
+        if not chapters_cut:
+            return
+
+        chapter_names = ", ".join(
+            f"'{w['chapter']}' (ends p.{w['chapter_end']})"
+            for w in chapters_cut
+        )
+
+        st.warning(
+            f"📖 **Page range extended: p.{original_end} → p.{extended_end}**  \n"
+            f"Your selection would have cut through {chapter_names}. "
+            f"The range was automatically extended to include complete chapters. "
+            f"You can disable this in Config (AUTO_EXTEND_PAGE_RANGE=False) "
+            f"if you prefer to process exact page ranges and let the "
+            f"completeness checker remove incomplete content instead."
+        )
+
+    @staticmethod
+    def render_completeness_report(
+        incomplete_pages:    set,
+        incomplete_chapters: set,
+        total_pages:         int,
+        total_chapters:      int,
+    ) -> None:
+        """
+        Show a summary of what the completeness checker found and removed.
+        Displayed after processing so the user knows exactly what they got.
+        """
+        if not incomplete_pages and not incomplete_chapters:
+            st.success(
+                "✅ **Completeness verified** — all pages and chapters "
+                "passed fingerprint verification. Audio covers the full "
+                "requested range."
+            )
+            return
+
+        lines = ["**⚠️ Completeness report:**"]
+
+        if incomplete_pages:
+            page_list = ", ".join(str(p + 1) for p in sorted(incomplete_pages))
+            lines.append(
+                f"- **{len(incomplete_pages)} page(s) removed** "
+                f"(fingerprint not found in assembled text): pages {page_list}"
+            )
+
+        if incomplete_chapters:
+            ch_list = ", ".join(f"'{c}'" for c in sorted(incomplete_chapters))
+            lines.append(
+                f"- **{len(incomplete_chapters)} chapter(s) removed** "
+                f"(last page failed verification or text ends mid-word): {ch_list}"
+            )
+
+        lines.append(
+            f"Audio covers {total_chapters - len(incomplete_chapters)} of "
+            f"{total_chapters} detected chapters."
+        )
+
+        st.warning("\n".join(lines))
+
+    @staticmethod
+    def render_pre_processing_summary(
+        total_pages:    int,
+        selected_pages: int,
+        chapters_found: list[dict],
+        est_minutes:    float,
+        est_audio_hrs:  float,
+        warnings:       list[dict],
+        extended_end:   int,
+        original_end:   int,
+    ) -> None:
+        """
+        Show the user a complete picture of what they're about to process
+        BEFORE they click Convert. Displayed immediately after a PDF is loaded.
+
+        Covers:
+          - Total pages vs selected pages
+          - Chapters detected in pre-scan
+          - Estimated processing time and audio output length
+          - Any chapter-boundary warnings with auto-extend notice
+        """
+        st.markdown("### 📋 What you're about to process")
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Total pages", total_pages)
+        with c2:
+            st.metric("Selected pages", selected_pages)
+        with c3:
+            st.metric("Chapters detected", len(chapters_found) if chapters_found else "—")
+        with c4:
+            st.metric("Est. audio output", f"{est_audio_hrs:.1f} hrs" if est_audio_hrs >= 1 else f"{int(est_audio_hrs * 60)} min")
+
+        st.caption(
+            f"Estimated processing time: {est_minutes:.0f}–{est_minutes * 1.5:.0f} min "
+            f"(depends on TTS engine and network). "
+            f"Keep this tab open — Streamlit does not process in the background."
+        )
+
+        # Chapter list from pre-scan
+        if chapters_found:
+            with st.expander(f"Chapters detected in pre-scan ({len(chapters_found)})", expanded=False):
+                for ch in chapters_found:
+                    in_range = ch["start"] <= (extended_end or original_end)
+                    icon     = "✅" if in_range else "⬜"
+                    st.caption(
+                        f"{icon} **{ch['title']}** — pp. {ch['start']}–{ch['end']}"
+                    )
+
+        # Warnings about chapter cuts
         if warnings:
             for w in warnings:
                 if w.get("extended"):
-                    logger.info(
-                        f"Prevention: auto-extended end page "
-                        f"{resolved_end} → {recommended_end} "
-                        f"for chapter '{w['chapter']}'"
+                    st.info(
+                        f"📖 Chapter boundary detected: **'{w['chapter']}'** "
+                        f"starts within your selection but ends on p.{w['chapter_end']}. "
+                        f"Page range auto-extended from p.{original_end} to p.{extended_end} "
+                        f"so this chapter is fully included."
+                    )
+                else:
+                    st.warning(
+                        f"⚠️ Chapter **'{w['chapter']}'** ends on p.{w['chapter_end']} "
+                        f"but your selection ends on p.{original_end}. "
+                        f"This chapter will be cut. Enable AUTO_EXTEND_PAGE_RANGE "
+                        f"in config to avoid this automatically."
                     )
 
-        final_end = recommended_end
+    # ================================================================== #
+    # SECTION 4 — DOCUMENT DISPLAY                                        #
+    # ================================================================== #
 
-    # ------------------------------------------------------------------ #
-    # STAGE 4: Extract blocks                                              #
-    # ------------------------------------------------------------------ #
-    with st.spinner(
-        f"Extracting text from pages {start_page}–{final_end} "
-        f"({'text mode' if detected_mode == 'text' else 'OCR mode'})…"
-    ):
-        try:
-            extraction_result = PDFProcessor.extract(
-                pdf_bytes=pdf_bytes,
-                lang_code=lang_code,
-                start_page=start_page,
-                end_page=final_end,
-                mode=detected_mode,
+    @staticmethod
+    def render_metadata(metadata: dict) -> None:
+        if not metadata:
+            return
+        fields = []
+        if metadata.get("title"):
+            fields.append(f"**Title:** {metadata['title']}")
+        if metadata.get("author"):
+            fields.append(f"**Author:** {metadata['author']}")
+        if metadata.get("subject"):
+            fields.append(f"**Subject:** {metadata['subject']}")
+        if fields:
+            st.info("  \n".join(fields))
+
+    @staticmethod
+    def render_processing_status(mode_used: str, page_count: int) -> None:
+        if mode_used == "text":
+            st.success(
+                f"✅ **Text mode** — native text extraction "
+                f"({page_count} pages). Fast and accurate."
             )
-        except Exception as e:
-            UIComponents.render_error(
-                f"Text extraction failed: {e}\n\n"
-                "If this is a scanned PDF, ensure packages.txt includes "
-                "tesseract-ocr and the correct language is selected."
+        else:
+            st.warning(
+                f"🔍 **OCR mode** — scanned PDF ({page_count} pages). "
+                f"Quality depends on scan resolution."
             )
-            logger.error(traceback.format_exc())
+
+    @staticmethod
+    def render_table_of_contents(
+        chapters:        OrderedDict,
+        current_chapter: str,
+        page_ranges:     dict = None,
+        chapter_status:  dict = None,
+    ) -> None:
+        """
+        Clickable TOC with page ranges, word counts, and live status icons.
+        """
+        st.subheader("Chapters")
+        if not chapters:
+            st.caption("No chapters detected.")
             return
 
-    blocks    = extraction_result["blocks"]
-    mode_used = extraction_result["mode_used"]
-    logger.info(f"[STAGE 4] Extraction complete: {len(blocks)} blocks, mode={mode_used}")
-    if blocks:
-        pages_with_blocks = len(set(b.get("page_num",0) for b in blocks))
-        font_sizes = sorted(set(round(b.get("font_size",0),1) for b in blocks if b.get("font_size",0)>0))
-        logger.info(f"[STAGE 4] Pages with blocks: {pages_with_blocks}, font sizes: {font_sizes}")
+        status_icons = {
+            "done":       "✅",
+            "processing": "⏳",
+            "failed":     "❌",
+            "queued":     "⬜",
+            "removed":    "🗑️",
+        }
 
-    if not blocks:
-        UIComponents.render_error(
-            "No text could be extracted from this PDF. "
-            "If it is scanned, ensure Tesseract OCR is installed."
-        )
-        return
+        for i, title in enumerate(chapters.keys()):
+            display_title = title if len(title) <= 40 else title[:37] + "…"
+            page_label    = ""
+            if page_ranges and title in page_ranges:
+                p1, p2 = page_ranges[title]
+                if p1 > 0:
+                    page_label = f"pp. {p1}–{p2}" if p1 != p2 else f"p. {p1}"
 
-    # ------------------------------------------------------------------ #
-    # STAGE 5: Auto-detect language                                        #
-    # ------------------------------------------------------------------ #
-    if Config.AUTO_DETECT_LANGUAGE and blocks:
-        sample_text   = " ".join(
-            b.get("text", "") for b in blocks[:50] if b.get("text", "").strip()
-        )
-        detected_lang = Translator.detect_language(sample_text)
-        st.session_state.detected_lang = detected_lang
-        logger.info(f"[STAGE 5] Auto-detected language: '{detected_lang}', sidebar was: '{lang_code}'")
-        if detected_lang != lang_code:
-            logger.info(f"[STAGE 5] Overriding lang_code: '{lang_code}' → '{detected_lang}'")
-            lang_code = detected_lang
+            status      = chapter_status.get(title, "") if chapter_status else ""
+            icon        = status_icons.get(status, "")
+            word_count  = len(chapters[title].split()) if chapters[title] else 0
+            sub_parts   = []
+            if page_label:
+                sub_parts.append(page_label)
+            if word_count:
+                sub_parts.append(f"{word_count:,} words")
+            sub         = " · ".join(sub_parts)
+            is_disabled = status in ("processing", "queued", "failed", "removed")
 
-    # ------------------------------------------------------------------ #
-    # STAGE 6: Build document structure                                    #
-    # ------------------------------------------------------------------ #
-    with st.spinner("Detecting headings and building chapter structure…"):
-        try:
-            document_structure = TextAnalyzer.build_document_structure(
-                blocks=blocks,
-                lang_code=lang_code,
-                remove_headers=remove_hf,
-            )
-        except Exception as e:
-            UIComponents.render_error(f"Chapter detection failed: {e}")
-            logger.error(traceback.format_exc())
-            return
-
-    chapters = document_structure["chapters"]
-    logger.info(f"[STAGE 6] Chapters built: {len(chapters)}")
-    for ch_title, ch_text in chapters.items():
-        logger.info(f"[STAGE 6]   '{ch_title[:60]}': {len(ch_text.split())} words, {len(ch_text)} chars")
-
-    if not chapters:
-        UIComponents.render_error(
-            "Document structure could not be determined. "
-            "The PDF may contain only images or non-standard encoding."
-        )
-        return
-
-    logger.info(f"Chapters detected: {list(chapters.keys())}")
-
-    # ------------------------------------------------------------------ #
-    # STAGE 7: Translate if requested                                      #
-    # ------------------------------------------------------------------ #
-    if translate and target_lang and target_lang != lang_code:
-        trans_config = Config.get_translation_config()
-        if translation_engine != "auto":
-            trans_config["primary_engine"]  = translation_engine
-            trans_config["fallback_engine"] = "none"
-
-        src_label = Config.SUPPORTED_LANGUAGES.get(lang_code,   {}).get("label", lang_code)
-        tgt_label = Config.SUPPORTED_LANGUAGES.get(target_lang, {}).get("label", target_lang)
-
-        with st.spinner(f"Translating {len(chapters)} chapters ({src_label} → {tgt_label})…"):
-            translated   = OrderedDict()
-            engine_used  = "original"
-
-            for ch_title, ch_text in chapters.items():
-                if not ch_text.strip():
-                    translated[ch_title] = ch_text
-                    continue
-                logger.info(f"[STAGE 7] Translating '{ch_title[:50]}': {len(ch_text)} chars, {len(ch_text.split())} words")
-                try:
-                    result_text, engine_used = Translator.translate_with_fallback(
-                        text=ch_text,
-                        source_lang=lang_code,
-                        target_lang=target_lang,
-                        config=trans_config,
-                    )
-                    logger.info(f"[STAGE 7]   Result: {len(result_text.split())} words via {engine_used}")
-                    if len(result_text.strip()) < 10:
-                        logger.error(f"[STAGE 7]   CRITICAL: Translation returned nearly empty result! Keeping original.")
-                        result_text = ch_text
-                    translated[ch_title] = result_text
-                except Exception as e:
-                    logger.warning(f"[STAGE 7] Translation failed for '{ch_title}': {e} — keeping original")
-                    translated[ch_title] = ch_text
-
-            chapters                               = translated
-            document_structure["chapters"]         = chapters
-            st.session_state.translation_engine_used = engine_used
-
-            # Only switch lang_code to target if translation actually succeeded
-            # (not "original" which means it failed or returned unchanged text)
-            if "original" not in engine_used:
-                lang_code = target_lang
-                logger.info(f"Translation complete via {engine_used}: {src_label} → {tgt_label}")
+            if title == current_chapter:
+                st.markdown(f"**{icon} ▶ {display_title}**")
+                if sub:
+                    st.caption(sub)
             else:
-                logger.warning(
-                    f"Translation returned original text ({src_label} → {tgt_label}). "
-                    f"Keeping lang_code={lang_code} for audio generation."
-                )
+                btn_label = f"{icon} {display_title}".strip() if icon else display_title
+                if st.button(
+                    btn_label,
+                    key=f"toc_btn_{i}",
+                    use_container_width=True,
+                    help=sub or f"{word_count:,} words",
+                    disabled=is_disabled,
+                ):
+                    st.session_state.current_chapter = title
+                    st.rerun()
 
-    # ------------------------------------------------------------------ #
-    # STAGE 8: Compute page ranges                                         #
-    # ------------------------------------------------------------------ #
-    page_ranges = TextAnalyzer.get_page_range_per_chapter(blocks, chapters)
-    st.session_state.page_ranges = page_ranges
-    logger.info(f"[STAGE 8] Page ranges: {page_ranges}")
-
-    # ------------------------------------------------------------------ #
-    # STAGE 9: Post-hoc incomplete page detection and removal              #
-    # ------------------------------------------------------------------ #
-    incomplete_pages    = set()
-    incomplete_chapters = set()
-
-    if remove_incomplete_pages:
-        with st.spinner("Verifying page completeness via word fingerprinting…"):
-            logger.info(f"[STAGE 9] Running incomplete page detection on {len(chapters)} chapters...")
-            incomplete_pages = TextAnalyzer.flag_incomplete_pages(blocks, chapters)
-            st.session_state.incomplete_pages = incomplete_pages
-            logger.info(f"[STAGE 9] Incomplete pages flagged: {[p+1 for p in sorted(incomplete_pages)]}")
-
-            if incomplete_pages:
-                # Only remove incomplete pages if we won't lose most content
-                total_pages_in_blocks = len(set(b.get("page_num",0) for b in blocks))
-                pct_flagged = len(incomplete_pages) / max(total_pages_in_blocks, 1)
-                if pct_flagged > 0.5:
-                    # More than 50% of pages flagged = fingerprint unreliable
-                    # (likely single-chapter doc where last page = last page of doc)
-                    logger.warning(
-                        f"[STAGE 9] SAFETY: {pct_flagged:.0%} of pages flagged "
-                        f"({len(incomplete_pages)}/{total_pages_in_blocks}) — "
-                        f"likely false positives. Skipping removal to preserve content."
-                    )
-                    st.session_state.incomplete_pages = set()
-                    incomplete_pages = set()
-                else:
-                    clean_blocks = [
-                        b for b in blocks
-                        if b.get("page_num") not in incomplete_pages
-                    ]
-                    rebuilt = TextAnalyzer.build_document_structure(
-                        blocks=clean_blocks,
-                        lang_code=lang_code,
-                        remove_headers=remove_hf,
-                    )
-                    # Safety: only use rebuilt if it has substantial content
-                    rebuilt_text = " ".join(rebuilt["chapters"].values())
-                    original_text = " ".join(chapters.values())
-                    pct_kept = len(rebuilt_text) / max(len(original_text), 1)
-                    logger.info(f"[STAGE 9] Rebuild: original={len(original_text.split())} words, rebuilt={len(rebuilt_text.split())} words ({pct_kept:.0%} kept)")
-                    if len(rebuilt_text) > len(original_text) * 0.3:
-                        chapters                       = rebuilt["chapters"]
-                        document_structure["chapters"] = chapters
-                        logger.info(f"[STAGE 9] Removed content from {len(incomplete_pages)} incomplete pages. New chapters: {len(chapters)}")
-                        for t, tx in chapters.items():
-                            logger.info(f"[STAGE 9]   '{t[:50]}': {len(tx.split())} words")
-                    else:
-                        logger.warning(
-                            f"[STAGE 9] SAFETY: Rebuild would lose {1-pct_kept:.0%} of content — skipping removal."
-                        )
-                        st.session_state.incomplete_pages = set()
-                        incomplete_pages = set()
-
-    # ------------------------------------------------------------------ #
-    # STAGE 10: Post-hoc incomplete chapter detection and removal          #
-    # ------------------------------------------------------------------ #
-    if remove_incomplete_chapters:
-        with st.spinner("Verifying chapter completeness…"):
-            logger.info(f"[STAGE 10] Running incomplete chapter detection...")
-            incomplete_chapters = TextAnalyzer.flag_incomplete_chapters(blocks, chapters)
-            st.session_state.incomplete_chapters = incomplete_chapters
-            logger.info(f"[STAGE 10] Incomplete chapters flagged: {list(incomplete_chapters)}")
-
-            if incomplete_chapters:
-                # Only remove if it won't wipe everything
-                if len(incomplete_chapters) >= len(chapters):
-                    logger.warning(
-                        "Incomplete chapter detection would remove all chapters — skipping."
-                    )
-                    st.session_state.incomplete_chapters = set()
-                    incomplete_chapters = set()
-                else:
-                    before_count = len(chapters)
-                    chapters     = OrderedDict(
-                        (t, v) for t, v in chapters.items()
-                        if t not in incomplete_chapters
-                    )
-                    document_structure["chapters"] = chapters
-                    logger.info(f"Removed {before_count - len(chapters)} incomplete chapters.")
-
-    if not chapters:
-        UIComponents.render_error(
-            "All chapters were removed by completeness verification. "
-            "This usually means the PDF was significantly truncated or "
-            "the page range selection did not capture full chapter content. "
-            "Try disabling 'Remove incomplete chapters' or extending the page range."
-        )
-        return
-
-    # ------------------------------------------------------------------ #
-    # STAGE 11: Generate audio (live chapter queue)                        #
-    # ------------------------------------------------------------------ #
-    audio_data:     dict[str, bytes] = {}
-    chapter_titles = list(chapters.keys())
-    total_chapters = len(chapter_titles)
-    total_words = sum(len(t.split()) for t in chapters.values())
-    logger.info(f"[STAGE 11] Starting audio generation: {total_chapters} chapters, {total_words} total words, lang={lang_code}, engine={tts_engine}")
-    for t, tx in chapters.items():
-        logger.info(f"[STAGE 11]   '{t[:50]}': {len(tx.split())} words")
-
-    # Initialise chapter_status for all chapters
-    chapter_status: dict[str, str] = {
-        title: "queued" for title in chapter_titles
-    }
-    # Mark removed chapters
-    for title in st.session_state.incomplete_chapters:
-        if title not in chapter_status:
-            chapter_status[title] = "removed"
-    st.session_state.chapter_status = chapter_status
-
-    # Live queue container — updates on each rerun
-    queue_container = st.empty()
-
-    progress_bar = st.progress(0, text="Generating audio…")
-
-    for i, chapter_title in enumerate(chapter_titles):
-        chapter_text = chapters[chapter_title]
-
-        if not chapter_text.strip():
-            chapter_status[chapter_title] = "removed"
-            st.session_state.chapter_status = chapter_status
-            continue
-
-        # Update status to processing
-        chapter_status[chapter_title] = "processing"
-        st.session_state.chapter_status = chapter_status
-
-        # Refresh queue display
-        with queue_container.container():
-            UIComponents.render_chapter_queue(
-                chapters=chapters,
-                audio_data=audio_data,
-                chapter_status=chapter_status,
-                page_ranges=page_ranges,
-            )
-
-        progress_bar.progress(i / total_chapters, text=f"Generating: '{chapter_title}' ({i+1}/{total_chapters})…")
-
-        try:
-            audio_bytes = AudioGenerator.generate_audio(
-                text=chapter_text,
-                lang_code=lang_code,
-                rate=rate,
-                pitch=pitch,
-                engine=tts_engine,
-            )
-            audio_data[chapter_title]          = audio_bytes
-            chapter_status[chapter_title]      = "done"
-            st.session_state.chapter_status    = chapter_status
-            st.session_state.audio_data        = audio_data
-
-            logger.info(
-                f"Audio OK: '{chapter_title}' — "
-                f"{AudioGenerator.get_file_size_mb(audio_bytes):.2f} MB"
-            )
-
-        except Exception as e:
-            logger.error(f"Audio generation failed for '{chapter_title}': {e}")
-            audio_data[chapter_title]       = AudioGenerator._generate_silence_bytes()
-            chapter_status[chapter_title]   = "failed"
-            st.session_state.chapter_status = chapter_status
-
-        # Refresh queue after each chapter completes
-        with queue_container.container():
-            UIComponents.render_chapter_queue(
-                chapters=chapters,
-                audio_data=audio_data,
-                chapter_status=chapter_status,
-                page_ranges=page_ranges,
-            )
-
-    progress_bar.progress(1.0, text="Audio generation complete.")
-
-    if not audio_data or all(
-        v == AudioGenerator._generate_silence_bytes() for v in audio_data.values()
-    ):
-        UIComponents.render_error(
-            "Audio generation failed for all chapters. "
-            "Check your internet connection (gTTS requires network). "
-            "Try switching to a different TTS engine."
-        )
-        return
-
-    # ------------------------------------------------------------------ #
-    # STAGE 12: Store results                                              #
-    # ------------------------------------------------------------------ #
-    st.session_state.audio_data         = audio_data
-    st.session_state.document_structure = document_structure
-    st.session_state.extraction_result  = extraction_result
-    st.session_state.pdf_bytes          = pdf_bytes
-    st.session_state.settings           = settings
-    st.session_state.chapter_status     = chapter_status
-    st.session_state.processing_done    = True
-
-    if st.session_state.current_chapter not in audio_data:
-        st.session_state.current_chapter = chapter_titles[0]
-
-    logger.info(
-        f"Pipeline complete: {len(audio_data)} chapters, "
-        f"mode={mode_used}, engine={tts_engine}, "
-        f"incomplete_pages={len(incomplete_pages)}, "
-        f"incomplete_chapters={len(incomplete_chapters)}."
-    )
-
-
-# ================================================================== #
-# RESULTS DISPLAY                                                      #
-# ================================================================== #
-
-def render_results() -> None:
-    audio_data         = st.session_state.audio_data
-    document_structure = st.session_state.document_structure
-    extraction_result  = st.session_state.extraction_result
-    pdf_bytes          = st.session_state.pdf_bytes
-    settings           = st.session_state.settings
-    current_chapter    = st.session_state.current_chapter
-    chapter_status     = st.session_state.chapter_status
-    page_ranges        = st.session_state.page_ranges
-    incomplete_pages   = st.session_state.incomplete_pages
-    incomplete_chaps   = st.session_state.incomplete_chapters
-
-    chapters   = document_structure["chapters"]
-    mode_used  = extraction_result["mode_used"]
-    page_count = extraction_result["page_count"]
-    metadata   = extraction_result["metadata"]
-
-    if current_chapter not in audio_data:
-        current_chapter = list(audio_data.keys())[0]
-        st.session_state.current_chapter = current_chapter
-
-    # Status banners
-    UIComponents.render_processing_status(mode_used, page_count)
-
-    if st.session_state.get("detected_lang"):
-        UIComponents.render_detected_language_banner(
-            detected_lang=st.session_state.detected_lang,
-            selected_lang=settings.get("lang_code", "en"),
-        )
-
-    engine_used_val = st.session_state.get("translation_engine_used", "")
-    if (settings.get("translate")
-            and engine_used_val
-            and "original" not in engine_used_val
-            and settings.get("target_lang") != settings.get("lang_code")):
-        UIComponents.render_translation_status(
-            chapters_translated=len(chapters),
-            total_chapters=len(chapters),
-            source_lang=settings.get("lang_code", "en"),
-            target_lang=settings.get("target_lang", "en"),
-            engine_used=engine_used_val,
-        )
-
-    # Page range extension banner
-    orig = st.session_state.get("original_end_page")
-    ext  = st.session_state.get("extended_end_page")
-    warn = st.session_state.get("pre_scan_warnings", [])
-    if orig and ext and ext > orig and warn:
-        UIComponents.render_page_range_warning(
-            original_end=orig,
-            extended_end=ext,
-            chapters_cut=warn,
-        )
-
-    # Completeness report
-    UIComponents.render_completeness_report(
-        incomplete_pages=incomplete_pages,
-        incomplete_chapters=incomplete_chaps,
-        total_pages=page_count,
-        total_chapters=len(chapters),
-    )
-
-    # Metadata
-    UIComponents.render_metadata(metadata)
-
-    # PDF preview
-    UIComponents.render_pdf_preview(pdf_bytes)
-
-    st.divider()
-
-    # Cost estimate (OpenAI only)
-    UIComponents.render_cost_estimate(chapters, settings.get("tts_engine", "gtts"))
-
-    # Main layout: TOC left, player right
-    col_toc, col_player = st.columns([1, 3])
-
-    with col_toc:
-        UIComponents.render_table_of_contents(
-            chapters=chapters,
-            current_chapter=current_chapter,
-            page_ranges=page_ranges,
-            chapter_status=chapter_status,
-        )
-        st.divider()
-        UIComponents.render_bookmark_button(current_chapter)
-        UIComponents.render_bookmarks_list(chapters)
-
-    with col_player:
-        current_audio = audio_data.get(current_chapter, b"")
-        chapter_index = list(chapters.keys()).index(current_chapter)
-
-        UIComponents.render_audio_player(
-            audio_bytes=current_audio,
-            chapter_title=current_chapter,
-            chapter_index=chapter_index,
-            total_chapters=len(chapters),
-        )
-        UIComponents.render_chapter_navigation(chapters, current_chapter)
-        st.divider()
-        UIComponents.render_progress(current_chapter, chapters)
-        st.divider()
-        UIComponents.render_download_buttons(
-            audio_data=audio_data,
-            current_chapter=current_chapter,
-            chapters=chapters,
-        )
-
-    # Analysis panel
-    if settings.get("show_analysis", False):
-        st.divider()
-        _render_analysis_section(document_structure, settings["lang_code"])
-
-
-def _render_analysis_section(document_structure: dict, lang_code: str) -> None:
-    chapters     = document_structure["chapters"]
-    full_text    = TextAnalyzer.get_full_text(chapters)
-    word_count   = TextAnalyzer.get_word_count(full_text)
-    reading_time = TextAnalyzer.get_reading_time_estimate(full_text)
-
-    with st.spinner("Running document analysis…"):
-        keywords             = TextAnalyzer.extract_keywords(full_text, lang_code)
-        characters           = TextAnalyzer.detect_character_names(full_text, lang_code)
-        summary              = TextAnalyzer.summarize_text(full_text, lang_code)
-        sentiment            = TextAnalyzer.sentiment_analysis(full_text, lang_code)
-        readability          = TextAnalyzer.compute_readability(full_text)
-        text_stats           = TextAnalyzer.compute_text_stats(full_text, chapters)
-        content_type         = TextAnalyzer.detect_content_type(full_text, chapters)
-        topic_density        = TextAnalyzer.compute_topic_density(full_text, keywords)
-        chapter_complexity   = TextAnalyzer.detect_language_complexity_by_chapter(chapters)
-        lexical_diversity    = TextAnalyzer.compute_lexical_diversity(full_text)
-        sentence_complexity  = TextAnalyzer.compute_sentence_complexity(full_text)
-
-    UIComponents.render_analysis_panel(
-        keywords=keywords,
-        characters=characters,
-        summary=summary,
-        sentiment=sentiment,
-        reading_time=reading_time,
-        word_count=word_count,
-        readability=readability,
-        text_stats=text_stats,
-        content_type=content_type,
-        topic_density=topic_density,
-        chapter_complexity=chapter_complexity,
-        lexical_diversity=lexical_diversity,
-        sentence_complexity=sentence_complexity,
-    )
-
-
-# ================================================================== #
-# MAIN                                                                 #
-# ================================================================== #
-
-def main() -> None:
-    st.set_page_config(
-        page_title=Config.APP_NAME,
-        page_icon="🎧",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-    initialize_session_state()
-
-    # Sidebar settings
-    max_pages = 1
-    if st.session_state.pdf_bytes:
-        try:
-            max_pages = PDFProcessor.get_page_count(st.session_state.pdf_bytes)
-        except Exception:
-            max_pages = 1
-
-    # Pre-detect language from PDF before sidebar renders so the
-    # language selector defaults to the correct language on first load.
-    # This is a fast peek — just first 500 chars of text from page 2.
-    if st.session_state.pdf_bytes and not st.session_state.get("detected_lang"):
-        try:
-            import fitz as _fitz
-            _doc = _fitz.open(stream=st.session_state.pdf_bytes, filetype="pdf")
-            _sample = ""
-            for _pn in range(min(3, len(_doc))):
-                _sample += _doc[_pn].get_text("text")[:300]
-            _doc.close()
-            if _sample.strip():
-                _pre_detected = Translator.detect_language(_sample)
-                if _pre_detected and _pre_detected != "en":
-                    st.session_state.detected_lang = _pre_detected
-                    logger.info(f"Pre-scan language detection: '{_pre_detected}'")
-        except Exception as _e:
-            logger.debug(f"Pre-scan language detection failed: {_e}")
-
-    settings = UIComponents.render_sidebar_settings(max_pages=max_pages)
-
-    # Header
-    st.title(f"🎧 {Config.APP_NAME}")
-    st.caption(Config.DESCRIPTION)
-
-    # File input
-    st.subheader("Upload PDF")
-    file_source = st.radio(
-        "File source",
-        options=["Upload file", "Local file"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-
-    pdf_bytes = None
-
-    if file_source == "Upload file":
-        pdf_file = UIComponents.file_uploader_widget()
-        if pdf_file is not None:
-            pdf_bytes = pdf_file.read()
-    else:
-        local_path = UIComponents.local_file_selector(folder_path=".")
-        if local_path:
+    @staticmethod
+    def render_pdf_preview(pdf_bytes: bytes) -> None:
+        with st.expander("📄 Preview PDF", expanded=False):
             try:
-                with open(local_path, "rb") as f:
-                    pdf_bytes = f.read()
-            except OSError as e:
-                UIComponents.render_error(f"Could not read file: {e}")
-
-    # Pre-processing summary (shown as soon as PDF is loaded)
-    if pdf_bytes is not None:
-        size_mb    = len(pdf_bytes) / (1024 * 1024)
-        page_count = PDFProcessor.get_page_count(pdf_bytes)
-        start_pg   = settings["start_page"]
-        end_pg     = settings["end_page"] if settings["end_page"] > 1 else page_count
-
-        # Quick pre-scan for summary (cached)
-        heading_pages = PDFProcessor.get_heading_pages(pdf_bytes)
-        recommended_end, warnings = TextAnalyzer.get_chapter_aware_page_range(
-            heading_pages=heading_pages,
-            requested_start=start_pg,
-            requested_end=end_pg,
-            total_pages=page_count,
-        )
-
-        # Build chapter list for summary
-        chapters_for_summary = []
-        if heading_pages:
-            seen_pg: dict = {}
-            for h in sorted(heading_pages, key=lambda x: x["page_num"]):
-                pn = h["page_num"]
-                if pn not in seen_pg or h["font_size"] > seen_pg[pn]["font_size"]:
-                    seen_pg[pn] = h
-            unique = sorted(seen_pg.values(), key=lambda x: x["page_num"])
-            for i, h in enumerate(unique):
-                ch_start = h["page_num"] + 1
-                ch_end   = unique[i + 1]["page_num"] if i + 1 < len(unique) else page_count
-                chapters_for_summary.append({
-                    "title": h["text"], "start": ch_start, "end": ch_end
-                })
-
-        # Estimate processing time: ~30 seconds per chapter for gTTS
-        est_chapters  = max(len(chapters_for_summary), 1)
-        est_minutes   = est_chapters * 0.5  # rough: 30s per chapter
-        selected_pages = end_pg - start_pg + 1
-        # Estimate audio: ~150 wpm, ~1 min audio per 150 words, ~300 words/page
-        est_words     = selected_pages * 300
-        est_audio_hrs = (est_words / 150) / 60
-
-        st.caption(f"File: {size_mb:.2f} MB · {page_count} pages")
-
-        UIComponents.render_pre_processing_summary(
-            total_pages=page_count,
-            selected_pages=selected_pages,
-            chapters_found=chapters_for_summary,
-            est_minutes=est_minutes,
-            est_audio_hrs=est_audio_hrs,
-            warnings=warnings,
-            extended_end=recommended_end,
-            original_end=end_pg,
-        )
-
-        st.divider()
-
-        # Convert button
-        if st.button("🎙️ Convert to Audio", type="primary", use_container_width=True):
-            _reset_pipeline_state()
-            run_pipeline(pdf_bytes=pdf_bytes, settings=settings)
-            if st.session_state.processing_done:
-                UIComponents.render_success(
-                    "Conversion complete! Navigate chapters using the list on the left."
+                b64_pdf  = base64.b64encode(pdf_bytes).decode("utf-8")
+                pdf_html = (
+                    f'<iframe src="data:application/pdf;base64,{b64_pdf}" '
+                    f'width="100%" height="500px" type="application/pdf"></iframe>'
                 )
+                st.markdown(pdf_html, unsafe_allow_html=True)
+            except Exception as e:
+                st.warning(f"PDF preview unavailable: {e}")
+
+    # ================================================================== #
+    # SECTION 5 — AUDIO PLAYER                                           #
+    # ================================================================== #
+
+    @staticmethod
+    def render_audio_player(
+        audio_bytes:    bytes,
+        chapter_title:  str,
+        chapter_index:  int,
+        total_chapters: int,
+    ) -> None:
+        if not audio_bytes:
+            st.warning("No audio available for this chapter.")
+            return
+
+        st.markdown(
+            f"**{chapter_title}**  "
+            f"<small style='color:gray'>Chapter {chapter_index + 1} of {total_chapters}</small>",
+            unsafe_allow_html=True,
+        )
+        st.audio(audio_bytes, format="audio/mp3")
+
+    @staticmethod
+    def render_chapter_navigation(chapters: OrderedDict, current_chapter: str) -> None:
+        chapter_list = list(chapters.keys())
+        current_idx  = chapter_list.index(current_chapter) if current_chapter in chapter_list else 0
+
+        col1, col2, col3 = st.columns([1, 2, 1])
+
+        with col1:
+            if current_idx > 0:
+                if st.button("⬅️ Previous", use_container_width=True):
+                    st.session_state.current_chapter = chapter_list[current_idx - 1]
+                    st.rerun()
+
+        with col2:
+            st.caption(f"Chapter {current_idx + 1} of {len(chapter_list)}")
+
+        with col3:
+            if current_idx < len(chapter_list) - 1:
+                if st.button("Next ➡️", use_container_width=True):
+                    st.session_state.current_chapter = chapter_list[current_idx + 1]
+                    st.rerun()
+
+    @staticmethod
+    def render_progress(current_chapter: str, chapters: OrderedDict) -> None:
+        chapter_list = list(chapters.keys())
+        if not chapter_list:
+            return
+        idx = chapter_list.index(current_chapter) if current_chapter in chapter_list else 0
+        pct = (idx + 1) / len(chapter_list)
+        st.progress(pct, text=f"Progress: {idx + 1}/{len(chapter_list)} chapters")
+
+    # ================================================================== #
+    # SECTION 5B — LIVE CHAPTER QUEUE                                    #
+    # ================================================================== #
+
+    @staticmethod
+    def render_chapter_queue(
+        chapters:       OrderedDict,
+        audio_data:     dict,
+        chapter_status: dict,
+        page_ranges:    dict = None,
+    ) -> None:
+        """
+        Live queue showing per-chapter status during and after processing.
+        Each completed chapter gets an individual download button immediately.
+        """
+        status_icons = {
+            "done":       "✅",
+            "processing": "⏳",
+            "failed":     "❌",
+            "queued":     "⬜",
+            "removed":    "🗑️",
+        }
+
+        done_count    = sum(1 for s in chapter_status.values() if s == "done")
+        total_count   = sum(1 for s in chapter_status.values() if s != "removed")
+        removed_count = sum(1 for s in chapter_status.values() if s == "removed")
+        pct           = int(done_count / total_count * 100) if total_count > 0 else 0
+
+        col_h1, col_h2 = st.columns([4, 1])
+        with col_h1:
+            st.markdown(
+                f"**Processing queue** — {done_count}/{total_count} chapters complete"
+                + (f" · {removed_count} removed" if removed_count else "")
+            )
+        with col_h2:
+            st.caption(f"{pct}% done")
+
+        st.progress(pct / 100.0)
+
+        for title, text in chapters.items():
+            status      = chapter_status.get(title, "queued")
+            icon        = status_icons.get(status, "⬜")
+            display     = title if len(title) <= 35 else title[:32] + "…"
+            word_count  = len(text.split()) if text else 0
+
+            page_label  = ""
+            if page_ranges and title in page_ranges:
+                p1, p2 = page_ranges[title]
+                if p1 > 0:
+                    page_label = f"pp. {p1}–{p2}" if p1 != p2 else f"p. {p1}"
+
+            sub = f"{page_label} · {word_count:,} words" if page_label else f"{word_count:,} words"
+
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.markdown(f"{icon} **{display}**")
+                st.caption(sub)
+            with col2:
+                if status == "done" and title in audio_data:
+                    audio_bytes = audio_data[title]
+                    safe_name   = re.sub(r"[^a-zA-Z0-9_-]", "_", title)[:30]
+                    # Estimate duration from file size (MP3 at ~128kbps)
+                    dur_secs    = len(audio_bytes) / 16_000.0
+                    mins        = int(dur_secs) // 60
+                    secs        = int(dur_secs) % 60
+                    st.download_button(
+                        label=f"⬇️ {mins}:{secs:02d}",
+                        data=audio_bytes,
+                        file_name=f"{safe_name}.mp3",
+                        mime="audio/mpeg",
+                        key=f"dl_queue_{title[:20]}_{hash(title) % 9999}",
+                        use_container_width=True,
+                    )
+                elif status == "processing":
+                    st.caption("⏳")
+                elif status == "failed":
+                    st.caption("❌")
+                elif status == "removed":
+                    st.caption("🗑️")
+                else:
+                    st.caption("⬜")
+
+    # ================================================================== #
+    # SECTION 5C — DOWNLOAD BUTTONS                                       #
+    # ================================================================== #
+
+    @staticmethod
+    def render_download_buttons(
+        audio_data:      dict,
+        current_chapter: str,
+        chapters:        OrderedDict,
+    ) -> None:
+        """
+        Chapter download + Full Book download.
+        Full book label shows partial count when not all chapters are ready.
+        """
+        st.markdown("**⬇️ Downloads**")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            chapter_audio = audio_data.get(current_chapter, b"")
+            if chapter_audio:
+                safe_title = re.sub(r"[^a-zA-Z0-9_-]", "_", current_chapter)[:40]
+                st.download_button(
+                    label="📥 This Chapter",
+                    data=chapter_audio,
+                    file_name=f"{safe_title}.mp3",
+                    mime="audio/mpeg",
+                    use_container_width=True,
+                    help=f"Download '{current_chapter}' as MP3",
+                )
+            else:
+                st.button("📥 This Chapter", disabled=True, use_container_width=True)
+
+        with col2:
+            if audio_data:
+                silence_gap = bytes([
+                    0xFF, 0xFB, 0x90, 0x00,
+                    *([0x00] * 40),
+                ]) * 32
+
+                buf           = io.BytesIO()
+                chapter_order = list(chapters.keys())
+
+                for i, title in enumerate(chapter_order):
+                    ch_audio = audio_data.get(title, b"")
+                    if ch_audio:
+                        buf.write(ch_audio)
+                        if i < len(chapter_order) - 1:
+                            buf.write(silence_gap)
+
+                full_book_bytes = buf.getvalue()
+
+                if full_book_bytes:
+                    available = len(audio_data)
+                    total     = len(chapters)
+                    label     = (
+                        f"📚 Full Book ({available} of {total} chapters)"
+                        if available < total
+                        else f"📚 Full Book ({available} chapters)"
+                    )
+                    st.download_button(
+                        label=label,
+                        data=full_book_bytes,
+                        file_name="full_book.mp3",
+                        mime="audio/mpeg",
+                        use_container_width=True,
+                        help=f"Download {available} available chapters as one MP3",
+                    )
+                else:
+                    st.button("📚 Full Book", disabled=True, use_container_width=True)
+            else:
+                st.button("📚 Full Book", disabled=True, use_container_width=True)
+
+    # ================================================================== #
+    # SECTION 6 — BOOKMARKS                                               #
+    # ================================================================== #
+
+    @staticmethod
+    def render_bookmark_button(current_chapter: str) -> None:
+        bookmarks = st.session_state.get("bookmarks", [])
+        if current_chapter in bookmarks:
+            if st.button("🔖 Remove bookmark", use_container_width=True):
+                st.session_state.bookmarks.remove(current_chapter)
+                st.rerun()
+        else:
+            if st.button("🔖 Add bookmark", use_container_width=True):
+                if "bookmarks" not in st.session_state:
+                    st.session_state.bookmarks = []
+                st.session_state.bookmarks.append(current_chapter)
                 st.rerun()
 
-    elif st.session_state.processing_done:
-        UIComponents.render_info(
-            "The uploaded file has been cleared. Previous audio is still available below."
+    @staticmethod
+    def render_bookmarks_list(chapters: OrderedDict) -> None:
+        bookmarks = st.session_state.get("bookmarks", [])
+        if not bookmarks:
+            return
+
+        st.markdown("**🔖 Bookmarks**")
+        stale = []
+        for i, bm in enumerate(bookmarks):
+            if bm not in chapters:
+                stale.append(bm)
+                continue
+            display = bm if len(bm) <= 30 else bm[:27] + "…"
+            if st.button(display, key=f"bm_btn_{i}", use_container_width=True):
+                st.session_state.current_chapter = bm
+                st.rerun()
+
+        if stale:
+            st.session_state.bookmarks = [b for b in bookmarks if b not in stale]
+
+    # ================================================================== #
+    # SECTION 7 — ANALYSIS PANEL                                          #
+    # ================================================================== #
+
+    @staticmethod
+    def render_analysis_panel(
+        keywords:             list,
+        characters:           list,
+        summary:              str,
+        sentiment:            dict,
+        reading_time:         str,
+        word_count:           int,
+        readability:          dict  = None,
+        text_stats:           dict  = None,
+        content_type:         dict  = None,
+        topic_density:        list  = None,
+        chapter_complexity:   list  = None,
+        lexical_diversity:    dict  = None,
+        sentence_complexity:  dict  = None,
+    ) -> None:
+        st.subheader("📊 Document Intelligence")
+
+        # Row 1: core KPIs
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Words", f"{word_count:,}")
+        with c2:
+            st.metric("Est. Listening Time", reading_time)
+        if text_stats:
+            with c3:
+                st.metric("Unique Words", f"{text_stats.get('unique_words', 0):,}")
+            with c4:
+                vr = text_stats.get("vocabulary_richness", 0)
+                st.metric("Vocabulary Richness", f"{vr}%",
+                          help="Unique words / total words × 100. Higher = more diverse.")
+
+        st.divider()
+
+        # Row 2: readability + content type
+        col_read, col_type = st.columns([3, 2])
+
+        with col_read:
+            st.markdown("**📖 Readability**")
+            if readability:
+                fe = readability.get("flesch_ease", 0)
+                fk = readability.get("flesch_kincaid", 0)
+                gl = readability.get("grade_label", "Unknown")
+                el = readability.get("ease_label", "Unknown")
+                r1, r2, r3 = st.columns(3)
+                with r1:
+                    st.metric("Flesch Ease", f"{fe}/100",
+                              help="0=hardest, 100=easiest. 60–70 is standard adult reading.")
+                with r2:
+                    st.metric("Grade Level", f"{fk}")
+                with r3:
+                    st.metric("Reading Level", gl)
+                bar_color = "🟢" if fe >= 70 else ("🟡" if fe >= 50 else "🔴")
+                st.caption(f"{bar_color} {el} — {fe}/100 ease score")
+                if text_stats:
+                    s1, s2, s3 = st.columns(3)
+                    with s1:
+                        st.metric("Avg Sentence", f"{text_stats.get('avg_sentence_length', 0)} words",
+                                  help="Sentences >25 words are harder to follow in audio.")
+                    with s2:
+                        st.metric("Avg Word Length", f"{text_stats.get('avg_word_length', 0)} chars")
+                    with s3:
+                        st.metric("Sentences", f"{text_stats.get('total_sentences', 0):,}")
+
+        with col_type:
+            st.markdown("**🔍 Content Type**")
+            if content_type:
+                ct   = content_type.get("type", "General")
+                conf = content_type.get("confidence", 0)
+                type_icons = {
+                    "Academic":            "🎓",
+                    "Report / Analysis":   "📈",
+                    "Fiction / Narrative": "📚",
+                    "News / Article":      "📰",
+                    "Technical":           "⚙️",
+                    "Legal":               "⚖️",
+                    "General":             "📄",
+                }
+                st.metric(f"{type_icons.get(ct, '📄')} Detected Type", ct)
+                st.caption(f"Confidence: {conf}%")
+                for label, score in sorted(
+                    content_type.get("all_scores", {}).items(),
+                    key=lambda x: x[1], reverse=True
+                )[:3]:
+                    if score > 0:
+                        st.caption(f"  • {label}: {score} signals")
+
+        st.divider()
+
+        # Row 3: summary + sentiment
+        col_sum, col_sent = st.columns([3, 2])
+
+        with col_sum:
+            st.markdown("**📝 Summary**")
+            if summary:
+                st.write(summary)
+                st.caption("Extractive — first 3 content sentences.")
+            else:
+                st.caption("Summary unavailable.")
+
+        with col_sent:
+            st.markdown("**🎭 Tone & Sentiment**")
+            if sentiment:
+                label = sentiment.get("label", "Unknown")
+                conf  = sentiment.get("confidence", "low")
+                pos   = sentiment.get("positive_count", 0)
+                neg   = sentiment.get("negative_count", 0)
+                color_map = {"Positive": "🟢", "Negative": "🔴", "Neutral": "🟡"}
+                st.metric(f"{color_map.get(label, '⚪')} Tone", label)
+                st.caption(f"Confidence: {conf}")
+                st.caption(f"🟢 {pos} positive  •  🔴 {neg} negative")
+
+        st.divider()
+
+        # Row 4: topic density
+        if topic_density:
+            st.markdown("**🔑 Topic Density** *(occurrences per 1,000 words)*")
+            for item in topic_density[:12]:
+                word    = item["word"]
+                density = item["density_per_1k"]
+                bar_pct = item["bar_pct"]
+                count   = item["count"]
+                filled  = int(bar_pct / 5)
+                bar     = "█" * filled + "░" * (20 - filled)
+                st.markdown(f"`{word:<18}` {bar} **{density}**/1k  *(×{count})*")
+            st.divider()
+
+        # Row 5: chapter complexity
+        if chapter_complexity:
+            st.markdown("**📊 Complexity by Chapter** *(hardest → easiest to follow while listening)*")
+            for item in chapter_complexity:
+                title = item["title"]
+                ease  = item["flesch_ease"]
+                label = item["ease_label"]
+                wc    = item["word_count"]
+                icon  = "🔴" if ease < 50 else ("🟡" if ease < 70 else "🟢")
+                short = title if len(title) <= 40 else title[:37] + "…"
+                st.markdown(f"{icon} **{short}** — {label} ({ease}/100) · {wc:,} words")
+            st.divider()
+
+        # Row 6: Lexical diversity (new KPI)
+        if lexical_diversity:
+            st.markdown("**🔤 Lexical Diversity**")
+            st.caption(
+                "MATTR (Moving Average Type-Token Ratio) is length-independent and more "
+                "reliable than simple vocabulary richness for longer documents."
+            )
+            ld1, ld2, ld3, ld4 = st.columns(4)
+            with ld1:
+                st.metric("MATTR", f"{lexical_diversity.get('mattr', 0)}%",
+                          help="Higher = more diverse vocabulary (length-independent)")
+            with ld2:
+                st.metric("Type-Token Ratio", f"{lexical_diversity.get('ttr', 0)}%")
+            with ld3:
+                st.metric("Hapax Words", f"{lexical_diversity.get('hapax_count', 0):,}",
+                          help="Words appearing exactly once — indicator of specialized vocabulary")
+            with ld4:
+                st.metric("Avg Word Frequency", f"{lexical_diversity.get('avg_word_frequency', 0)}×")
+            st.divider()
+
+        # Row 7: Sentence complexity (new KPI)
+        if sentence_complexity:
+            st.markdown("**📏 Sentence Complexity** *(audio comprehension impact)*")
+            long_pct = sentence_complexity.get("long_sentence_pct", 0)
+            long_n   = sentence_complexity.get("long_sentence_count", 0)
+            longest  = sentence_complexity.get("longest_sentence_words", 0)
+            sc_color = "🔴" if long_pct > 30 else ("🟡" if long_pct > 15 else "🟢")
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
+                st.metric(
+                    "Long Sentences (>30 words)",
+                    f"{long_n} ({long_pct}%)",
+                    help="Sentences over 30 words are difficult to follow while listening"
+                )
+            with sc2:
+                st.metric("Longest Sentence", f"{longest} words")
+            with sc3:
+                st.metric("Short Fragments (<5 words)",
+                          f"{sentence_complexity.get('short_sentence_count', 0)}")
+            if long_pct > 20:
+                st.caption(
+                    f"{sc_color} {long_pct}% of sentences are long (>30 words). "
+                    "Consider using a slower playback speed for complex sections."
+                )
+            st.divider()
+
+        # Row 8: entities
+        if characters:
+            st.markdown("**👥 Recurring Names / Entities**")
+            st.write("  •  ".join(characters[:20]))
+            st.divider()
+
+        # Row 9: keywords
+        if keywords:
+            st.markdown("**💬 Top Keywords**")
+            kw_parts = [f"**{w}** ({ct})" for w, ct in keywords[:15]]
+            st.write("  •  ".join(kw_parts))
+
+    # ================================================================== #
+    # SECTION 8 — COST + FEEDBACK                                         #
+    # ================================================================== #
+
+    @staticmethod
+    def render_cost_estimate(chapters: OrderedDict, tts_engine: str) -> None:
+        if tts_engine != "openai":
+            return
+        total_chars = sum(len(t) for t in chapters.values())
+        cost_usd    = (total_chars / 1000) * 0.015
+        st.info(
+            f"💰 **OpenAI TTS estimate:** {total_chars:,} characters — "
+            f"~${cost_usd:.3f} USD at $0.015/1,000 chars."
         )
-    else:
-        st.divider()
-        st.markdown("""
-### How it works
 
-1. **Upload** a PDF — text-based or scanned
-2. **Review** the pre-processing summary — total pages, detected chapters,
-   estimated audio length, and any chapter boundary warnings
-3. **Configure** language, speed, translation, and completeness options in the sidebar
-4. **Click Convert** — the app extracts text, removes headers and footers,
-   verifies completeness via word fingerprinting, and generates audio chapter by chapter
-5. **Download** each chapter individually or the full book as one MP3
+    @staticmethod
+    def render_error(message: str) -> None:
+        st.error(f"❌ {message}")
 
-**Completeness guarantee:** before generating audio, the app verifies that the
-last words of each chapter page were fully captured. Incomplete pages are removed.
-If a chapter ends mid-word, it can be excluded entirely (opt-in).
+    @staticmethod
+    def render_success(message: str) -> None:
+        st.success(f"✅ {message}")
 
-**Translation:** upload an English article and generate Spanish audio, or any
-combination of the 10 supported languages. Uses Google Translate with
-LibreTranslate as fallback — both free.
+    @staticmethod
+    def render_warning(message: str) -> None:
+        st.warning(f"⚠️ {message}")
 
-**Supported languages:** English, Spanish, French, German, Italian,
-Russian, Chinese, Japanese, Arabic, Hindi, Portuguese, Dutch.
-        """)
+    @staticmethod
+    def render_info(message: str) -> None:
+        st.info(f"ℹ️ {message}")
 
-    # Results display
-    if st.session_state.processing_done:
-        st.divider()
-        render_results()
-
-
-if __name__ == "__main__":
-    main()
+    @staticmethod
+    def render_spinner_placeholder(message: str = "Processing…") -> None:
+        st.info(f"⏳ {message}")

@@ -391,10 +391,20 @@ class UIComponents:
         target_label = Config.SUPPORTED_LANGUAGES.get(target_lang, {}).get("label", target_lang)
         engine_names = {"google": "Google Translate", "libretranslate": "LibreTranslate"}
         engine_name  = engine_names.get(engine_used, engine_used)
-        st.success(
-            f"🌐 Translated {chapters_translated}/{total_chapters} chapters — "
-            f"{source_label} → {target_label} via {engine_name}"
-        )
+
+        if "original" in engine_used:
+            # Translation failed silently or was skipped
+            st.warning(
+                f"⚠️ Translation requested ({source_label} → {target_label}) but "
+                f"both engines failed or returned unchanged text. "
+                f"Audio will be generated in the original language. "
+                f"Tip: try LibreTranslate or check your network connection."
+            )
+        else:
+            st.success(
+                f"🌐 Translated {chapters_translated}/{total_chapters} chapters — "
+                f"{source_label} → {target_label} via {engine_name}"
+            )
 
     @staticmethod
     def render_page_range_warning(

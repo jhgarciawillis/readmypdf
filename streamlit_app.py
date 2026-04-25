@@ -700,6 +700,25 @@ def main() -> None:
         except Exception:
             max_pages = 1
 
+    # Pre-detect language from PDF before sidebar renders so the
+    # language selector defaults to the correct language on first load.
+    # This is a fast peek — just first 500 chars of text from page 2.
+    if st.session_state.pdf_bytes and not st.session_state.get("detected_lang"):
+        try:
+            import fitz as _fitz
+            _doc = _fitz.open(stream=st.session_state.pdf_bytes, filetype="pdf")
+            _sample = ""
+            for _pn in range(min(3, len(_doc))):
+                _sample += _doc[_pn].get_text("text")[:300]
+            _doc.close()
+            if _sample.strip():
+                _pre_detected = Translator.detect_language(_sample)
+                if _pre_detected and _pre_detected != "en":
+                    st.session_state.detected_lang = _pre_detected
+                    logger.info(f"Pre-scan language detection: '{_pre_detected}'")
+        except Exception as _e:
+            logger.debug(f"Pre-scan language detection failed: {_e}")
+
     settings = UIComponents.render_sidebar_settings(max_pages=max_pages)
 
     # Header

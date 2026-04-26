@@ -35,6 +35,7 @@ from pdf_processor import PDFProcessor
 from text_analyzer import TextAnalyzer
 from audio_generator import AudioGenerator
 from ui_components import UIComponents
+from docx_processor import DocxProcessor
 
 logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
@@ -122,96 +123,131 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
     # ------------------------------------------------------------------ #
     # STAGE 1: Validate                                                    #
     # ------------------------------------------------------------------ #
-    with st.spinner("Validating PDF…"):
-        valid, err = PDFProcessor.validate_pdf(pdf_bytes)
-        if not valid:
-            UIComponents.render_error(err)
-            return
+    is_docx = st.session_state.get("is_docx", False)
+
+    if is_docx:
+        with st.spinner("Validating DOCX…"):
+            valid, err = DocxProcessor.validate(pdf_bytes)
+            if not valid:
+                UIComponents.render_error(err)
+                return
+    else:
+        with st.spinner("Validating PDF…"):
+            valid, err = PDFProcessor.validate_pdf(pdf_bytes)
+            if not valid:
+                UIComponents.render_error(err)
+                return
 
     # ------------------------------------------------------------------ #
     # STAGE 2: Detect extraction mode                                      #
     # ------------------------------------------------------------------ #
-    with st.spinner("Analysing PDF structure…"):
-        configured_mode = Config.validate_extraction_mode()
-        detected_mode   = TextCleaner.detect_pdf_mode(pdf_bytes) if configured_mode == "auto" else configured_mode
-        logger.info(f"Extraction mode: {detected_mode}")
+    if is_docx:
+        detected_mode = "docx"
+        page_count    = st.session_state.get("docx_page_count", 1)
+    else:
+        with st.spinner("Analysing PDF structure…"):
+            configured_mode = Config.validate_extraction_mode()
+            detected_mode   = TextCleaner.detect_pdf_mode(pdf_bytes) if configured_mode == "auto" else configured_mode
+            logger.info(f"Extraction mode: {detected_mode}")
+        page_count = PDFProcessor.get_page_count(pdf_bytes)
 
-    page_count   = PDFProcessor.get_page_count(pdf_bytes)
     resolved_end = end_page if end_page > 1 else page_count
 
     # ------------------------------------------------------------------ #
     # STAGE 3: Pre-scan for chapter boundaries (prevention)               #
     # ------------------------------------------------------------------ #
-    with st.spinner("Scanning document structure for chapter boundaries…"):
-        heading_pages = PDFProcessor.get_heading_pages(pdf_bytes)
+    if is_docx:
+        # For DOCX, use headings already extracted in blocks
+        docx_blocks_prescan = st.session_state.get("docx_blocks", [])
+        heading_pages = [
+            {"text": b["text"], "page_num": b["page_num"], "font_size": 14.0}
+            for b in docx_blocks_prescan
+            if b.get("is_heading")
+        ]
+        recommended_end = page_count
+        warnings        = []
+        final_end       = page_count
+        st.session_state.pre_scan_warnings      = []
+        st.session_state.original_end_page      = page_count
+        st.session_state.extended_end_page      = page_count
+        st.session_state.chapters_found_prescan = [
+            {"title": h["text"], "start": h["page_num"]+1, "end": page_count}
+            for h in heading_pages[:10]
+        ]
+    else:
+        with st.spinner("Scanning document structure for chapter boundaries…"):
+            heading_pages = PDFProcessor.get_heading_pages(pdf_bytes)
 
-        recommended_end, warnings = TextAnalyzer.get_chapter_aware_page_range(
-            heading_pages=heading_pages,
-            requested_start=start_page,
-            requested_end=resolved_end,
-            total_pages=page_count,
-        )
+            recommended_end, warnings = TextAnalyzer.get_chapter_aware_page_range(
+                heading_pages=heading_pages,
+                requested_start=start_page,
+                requested_end=resolved_end,
+                total_pages=page_count,
+            )
 
-        st.session_state.pre_scan_warnings      = warnings
-        st.session_state.original_end_page      = resolved_end
-        st.session_state.extended_end_page      = recommended_end
-        st.session_state.chapters_found_prescan = []
+            st.session_state.pre_scan_warnings      = warnings
+            st.session_state.original_end_page      = resolved_end
+            st.session_state.extended_end_page      = recommended_end
+            st.session_state.chapters_found_prescan = []
 
-        # Build chapter list from pre-scan for the summary panel
-        if heading_pages:
-            from collections import defaultdict as _dd
-            seen: dict = {}
-            for h in sorted(heading_pages, key=lambda x: x["page_num"]):
-                pn = h["page_num"]
-                if pn not in seen or h["font_size"] > seen[pn]["font_size"]:
-                    seen[pn] = h
-            unique = sorted(seen.values(), key=lambda x: x["page_num"])
-            for i, h in enumerate(unique):
-                ch_start = h["page_num"] + 1
-                ch_end   = unique[i + 1]["page_num"] if i + 1 < len(unique) else page_count
-                st.session_state.chapters_found_prescan.append({
-                    "title": h["text"],
-                    "start": ch_start,
-                    "end":   ch_end,
-                })
+            if heading_pages:
+                seen: dict = {}
+                for h in sorted(heading_pages, key=lambda x: x["page_num"]):
+                    pn = h["page_num"]
+                    if pn not in seen or h["font_size"] > seen[pn]["font_size"]:
+                        seen[pn] = h
+                unique = sorted(seen.values(), key=lambda x: x["page_num"])
+                for i, h in enumerate(unique):
+                    ch_start = h["page_num"] + 1
+                    ch_end   = unique[i + 1]["page_num"] if i + 1 < len(unique) else page_count
+                    st.session_state.chapters_found_prescan.append({
+                        "title": h["text"],
+                        "start": ch_start,
+                        "end":   ch_end,
+                    })
 
-        if warnings:
-            for w in warnings:
-                if w.get("extended"):
-                    logger.info(
-                        f"Prevention: auto-extended end page "
-                        f"{resolved_end} → {recommended_end} "
-                        f"for chapter '{w['chapter']}'"
-                    )
+            if warnings:
+                for w in warnings:
+                    if w.get("extended"):
+                        logger.info(
+                            f"Prevention: auto-extended end page "
+                            f"{resolved_end} → {recommended_end} "
+                            f"for chapter '{w['chapter']}'"
+                        )
 
-        final_end = recommended_end
+            final_end = recommended_end
 
     # ------------------------------------------------------------------ #
     # STAGE 4: Extract blocks                                              #
     # ------------------------------------------------------------------ #
-    with st.spinner(
-        f"Extracting text from pages {start_page}–{final_end} "
-        f"({'text mode' if detected_mode == 'text' else 'OCR mode'})…"
-    ):
-        try:
-            extraction_result = PDFProcessor.extract(
-                pdf_bytes=pdf_bytes,
-                lang_code=lang_code,
-                start_page=start_page,
-                end_page=final_end,
-                mode=detected_mode,
-            )
-        except Exception as e:
-            UIComponents.render_error(
-                f"Text extraction failed: {e}\n\n"
-                "If this is a scanned PDF, ensure packages.txt includes "
-                "tesseract-ocr and the correct language is selected."
-            )
-            logger.error(traceback.format_exc())
-            return
-
-    blocks    = extraction_result["blocks"]
-    mode_used = extraction_result["mode_used"]
+    if is_docx:
+        # Blocks already extracted on upload — reuse from session state
+        blocks    = st.session_state.get("docx_blocks", [])
+        mode_used = "docx"
+        logger.info(f"[STAGE 4] DOCX blocks reused: {len(blocks)} blocks")
+    else:
+        with st.spinner(
+            f"Extracting text from pages {start_page}–{final_end} "
+            f"({'text mode' if detected_mode == 'text' else 'OCR mode'})…"
+        ):
+            try:
+                extraction_result = PDFProcessor.extract(
+                    pdf_bytes=pdf_bytes,
+                    lang_code=lang_code,
+                    start_page=start_page,
+                    end_page=final_end,
+                    mode=detected_mode,
+                )
+            except Exception as e:
+                UIComponents.render_error(
+                    f"Text extraction failed: {e}\n\n"
+                    "If this is a scanned PDF, ensure packages.txt includes "
+                    "tesseract-ocr and the correct language is selected."
+                )
+                logger.error(traceback.format_exc())
+                return
+        blocks    = extraction_result["blocks"]
+        mode_used = extraction_result["mode_used"]
     logger.info(f"[STAGE 4] Extraction complete: {len(blocks)} blocks, mode={mode_used}")
     if blocks:
         pages_with_blocks = len(set(b.get("page_num",0) for b in blocks))
@@ -722,8 +758,14 @@ def run_bulk_pipeline(uploaded_files: list, settings: dict) -> None:
             status_placeholder.info(f"⏳ **{display_name}** — processing…")
 
         try:
+            is_docx_file = DocxProcessor.is_docx(raw_name)
+
             # Validate
-            valid, err = PDFProcessor.validate_pdf(pdf_bytes)
+            if is_docx_file:
+                valid, err = DocxProcessor.validate(pdf_bytes)
+            else:
+                valid, err = PDFProcessor.validate_pdf(pdf_bytes)
+
             if not valid:
                 results.append({
                     "name": display_name, "filename": raw_name,
@@ -734,23 +776,25 @@ def run_bulk_pipeline(uploaded_files: list, settings: dict) -> None:
                     status_placeholder.error(f"❌ **{display_name}** — {err}")
                 continue
 
-            # Extract all pages
-            page_count = PDFProcessor.get_page_count(pdf_bytes)
-            mode       = TextCleaner.detect_pdf_mode(pdf_bytes)
-
-            extraction = PDFProcessor.extract(
-                pdf_bytes=pdf_bytes,
-                lang_code="en",      # preliminary; re-detected below
-                start_page=1,
-                end_page=page_count,
-                mode=mode,
-            )
+            # Extract blocks (PDF or DOCX)
+            if is_docx_file:
+                extraction = DocxProcessor.extract(pdf_bytes)
+            else:
+                page_count = PDFProcessor.get_page_count(pdf_bytes)
+                mode       = TextCleaner.detect_pdf_mode(pdf_bytes)
+                extraction = PDFProcessor.extract(
+                    pdf_bytes=pdf_bytes,
+                    lang_code="en",
+                    start_page=1,
+                    end_page=page_count,
+                    mode=mode,
+                )
             blocks = extraction["blocks"]
 
             # Quick language detection on raw text
             raw_text = " ".join(b.get("text", "") for b in blocks)
             if not raw_text.strip():
-                raise ValueError("No text extracted from PDF")
+                raise ValueError("No text extracted from file")
 
             detected_lang = Translator.detect_language(raw_text[:1000]) or "en"
             lang_code = detected_lang
@@ -821,7 +865,7 @@ def run_bulk_pipeline(uploaded_files: list, settings: dict) -> None:
 
             results.append({
                 "name":         display_name,
-                "filename":     raw_name.rsplit(".", 1)[0] + ".mp3",
+                "filename":     re.sub(r"\.(pdf|docx)$", "", raw_name, flags=re.IGNORECASE) + ".mp3",
                 "audio":        audio_bytes,
                 "words":        word_count,
                 "lang":         audio_lang,
@@ -986,11 +1030,11 @@ def main() -> None:
     # ── BULK MODE ─────────────────────────────────────────────────────── #
     if upload_mode == "Bulk (multiple PDFs)":
         bulk_files = st.file_uploader(
-            "Upload PDFs",
-            type=["pdf"],
+            "Upload PDFs or DOCX files",
+            type=["pdf", "docx"],
             accept_multiple_files=True,
             label_visibility="collapsed",
-            help="Upload multiple PDFs. Each will be converted to a separate MP3.",
+            help="Upload multiple PDFs or Word (.docx) files. Each becomes a separate MP3.",
         )
 
         if bulk_files:
@@ -1000,7 +1044,8 @@ def main() -> None:
             )
             with st.expander(f"Files ({len(bulk_files)})"):
                 for bf in bulk_files:
-                    st.caption(f"• {bf.name} ({bf.size/1024:.0f} KB)")
+                    ftype = "📝 DOCX" if DocxProcessor.is_docx(bf.name) else "📄 PDF"
+                    st.caption(f"• {ftype}  {bf.name} ({bf.size/1024:.0f} KB)")
 
             # ── Language mode selector (bulk-specific) ────────────────── #
             st.markdown("**🌐 Output Language**")
@@ -1064,15 +1109,44 @@ def main() -> None:
     pdf_bytes = None
 
     if file_source == "Upload file":
-        pdf_file = UIComponents.file_uploader_widget()
-        if pdf_file is not None:
-            pdf_bytes = pdf_file.read()
+        uploaded = st.file_uploader(
+            "Upload PDF or DOCX",
+            type=["pdf", "docx"],
+            label_visibility="collapsed",
+            help="Upload a PDF or Word (.docx) file to convert to audio.",
+        )
+        if uploaded is not None:
+            file_bytes_raw = uploaded.read()
+            # Route to the right processor based on file type
+            if DocxProcessor.is_docx(uploaded.name):
+                # Convert DOCX blocks to the same pipeline format as PDF
+                docx_result = DocxProcessor.extract(file_bytes_raw)
+                # Store raw bytes as a synthetic "pdf_bytes" placeholder
+                # Pipeline uses docx_blocks from session state instead
+                st.session_state["docx_blocks"]    = docx_result["blocks"]
+                st.session_state["docx_metadata"]  = docx_result["metadata"]
+                st.session_state["docx_page_count"] = docx_result["page_count"]
+                st.session_state["is_docx"]        = True
+                pdf_bytes = file_bytes_raw   # kept for upload change detection
+            else:
+                st.session_state["is_docx"] = False
+                pdf_bytes = file_bytes_raw
     else:
         local_path = UIComponents.local_file_selector(folder_path=".")
         if local_path:
             try:
                 with open(local_path, "rb") as f:
-                    pdf_bytes = f.read()
+                    file_bytes_raw = f.read()
+                if DocxProcessor.is_docx(local_path):
+                    docx_result = DocxProcessor.extract(file_bytes_raw)
+                    st.session_state["docx_blocks"]     = docx_result["blocks"]
+                    st.session_state["docx_metadata"]   = docx_result["metadata"]
+                    st.session_state["docx_page_count"] = docx_result["page_count"]
+                    st.session_state["is_docx"]         = True
+                    pdf_bytes = file_bytes_raw
+                else:
+                    st.session_state["is_docx"] = False
+                    pdf_bytes = file_bytes_raw
             except OSError as e:
                 UIComponents.render_error(f"Could not read file: {e}")
 

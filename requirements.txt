@@ -10,3 +10,5 @@ requests>=2.32.0
 langdetect==1.0.9
 googletrans==4.0.2
 httpx>=0.24.0
+python-docx>=1.2.0
+# cache-bust: 20260426-193622

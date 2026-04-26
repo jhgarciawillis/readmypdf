@@ -390,7 +390,12 @@ class UIComponents:
 
     @staticmethod
     def render_extraction_mode_banner(mode: str, page_count: int) -> None:
-        if mode == "text":
+        if mode == "docx":
+            st.success(
+                f"✅ Word document — native DOCX extraction (~{page_count} pages). "
+                "Fast and accurate."
+            )
+        elif mode == "text":
             st.success(
                 f"✅ Text mode — native text extraction ({page_count} pages). "
                 "Fast and accurate."

@@ -684,18 +684,22 @@ def _get_pdf_display_name(filename: str, pdf_bytes: bytes) -> str:
 def run_bulk_pipeline(uploaded_files: list, settings: dict) -> None:
     """
     Process multiple PDFs sequentially → one MP3 per PDF.
-    Results stored in st.session_state.bulk_results as:
-        [{"name": str, "filename": str, "audio": bytes, "words": int,
-          "status": "done"|"error", "error_msg": str}, ...]
+
+    Language modes (settings["bulk_lang_mode"]):
+      "Keep original"   — audio in each PDF's detected language, no translation
+      "Normalize to…"   — translate only if detected lang ≠ bulk_target_lang
+      "Translate all…"  — always translate to bulk_target_lang
+
+    Results stored in st.session_state.bulk_results.
     """
     if "bulk_results" not in st.session_state:
         st.session_state.bulk_results = []
 
-    tts_engine  = settings["tts_engine"]
-    translate   = settings.get("translate", False)
-    target_lang = settings.get("target_lang", "en")
+    tts_engine   = settings["tts_engine"]
     trans_engine = settings.get("translation_engine", "auto")
-    remove_hf   = settings.get("remove_headers_footers", True)
+    remove_hf    = settings.get("remove_headers_footers", True)
+    lang_mode    = settings.get("bulk_lang_mode", "Keep original (per-file auto-detect)")
+    target_lang  = settings.get("bulk_target_lang", "en")
 
     total = len(uploaded_files)
     progress_bar = st.progress(0.0, text=f"0/{total} PDFs processed")
@@ -763,15 +767,24 @@ def run_bulk_pipeline(uploaded_files: list, settings: dict) -> None:
             if not full_text:
                 raise ValueError("No text after processing")
 
-            # Translate if requested
-            audio_lang = lang_code
-            if translate and target_lang and target_lang != lang_code:
-                translated, engine_used = Translator.translate_text(
-                    text=full_text,
-                    source_lang=lang_code,
-                    target_lang=target_lang,
-                    engine=trans_engine,
-                )
+            # Determine whether to translate based on language mode
+            audio_lang    = lang_code
+            should_translate = False
+            if "Normalize" in lang_mode:
+                # Translate only if the detected lang differs from target
+                should_translate = (lang_code != target_lang)
+            elif "Translate all" in lang_mode:
+                should_translate = True
+            # else: "Keep original" — no translation
+
+            if should_translate:
+                with st.spinner(f"Translating {display_name[:30]}…"):
+                    translated, engine_used = Translator.translate_text(
+                        text=full_text,
+                        source_lang=lang_code,
+                        target_lang=target_lang,
+                        engine=trans_engine,
+                    )
                 if "original" not in engine_used:
                     full_text  = translated
                     audio_lang = target_lang
@@ -793,22 +806,35 @@ def run_bulk_pipeline(uploaded_files: list, settings: dict) -> None:
                 tld=_tld,
             )
 
-            results.append({
-                "name":      display_name,
-                "filename":  raw_name.rsplit(".", 1)[0] + ".mp3",
-                "audio":     audio_bytes,
-                "words":     word_count,
-                "lang":      audio_lang,
-                "status":    "done",
-                "error_msg": "",
-            })
-
             dur_secs = len(audio_bytes) / 16_000.0
             mins = int(dur_secs) // 60
             secs = int(dur_secs) % 60
+
+            # Build informative lang tag for display
+            lang_labels = Config.get_all_language_labels()
+            src_label   = lang_labels.get(lang_code, lang_code).split()[0]
+            out_label   = lang_labels.get(audio_lang, audio_lang).split()[0]
+            if audio_lang != lang_code:
+                lang_tag = f"{src_label} → {out_label}"
+            else:
+                lang_tag = src_label
+
+            results.append({
+                "name":         display_name,
+                "filename":     raw_name.rsplit(".", 1)[0] + ".mp3",
+                "audio":        audio_bytes,
+                "words":        word_count,
+                "lang":         audio_lang,
+                "detected_lang": lang_code,
+                "lang_tag":     lang_tag,
+                "status":       "done",
+                "error_msg":    "",
+            })
+
             with results_container:
                 status_placeholder.success(
-                    f"✅ **{display_name}** — {word_count:,} words · {mins}:{secs:02d}"
+                    f"✅ **{display_name}** — {lang_tag} · "
+                    f"{word_count:,} words · {mins}:{secs:02d}"
                 )
 
         except Exception as exc:
@@ -831,22 +857,44 @@ def render_bulk_results() -> None:
     if not results:
         return
 
-    done    = [r for r in results if r["status"] == "done"]
-    errors  = [r for r in results if r["status"] == "error"]
+    import zipfile
+
+    done   = [r for r in results if r["status"] == "done"]
+    errors = [r for r in results if r["status"] == "error"]
 
     st.markdown("---")
-    st.subheader(f"📦 Results — {len(done)} of {len(results)} converted")
+    st.subheader(f"📦 Bulk Results — {len(done)} of {len(results)} converted")
 
     if errors:
-        with st.expander(f"⚠️ {len(errors)} failed"):
+        with st.expander(f"⚠️ {len(errors)} failed — click to see details"):
             for r in errors:
                 st.error(f"**{r['name']}** — {r['error_msg']}")
 
     if not done:
         return
 
-    # Bulk ZIP download
-    import zipfile
+    # Summary stats
+    total_words = sum(r["words"] for r in done)
+    total_secs  = sum(len(r["audio"]) / 16_000.0 for r in done)
+    total_mins  = int(total_secs) // 60
+
+    # Language breakdown
+    from collections import Counter
+    lang_counts = Counter(r.get("lang_tag", r.get("lang", "?")) for r in done)
+    lang_summary = " · ".join(
+        f"{count}× {tag}" for tag, count in lang_counts.most_common()
+    )
+
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("Files converted", len(done))
+    col_b.metric("Total words", f"{total_words:,}")
+    col_c.metric("Est. listening time", f"~{total_mins} min")
+    if lang_summary:
+        st.caption(f"Languages: {lang_summary}")
+
+    st.divider()
+
+    # ZIP download
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for r in done:
@@ -854,7 +902,7 @@ def render_bulk_results() -> None:
     zip_buf.seek(0)
 
     st.download_button(
-        label=f"📦 Download All as ZIP ({len(done)} MP3s)",
+        label=f"📦 Download All as ZIP ({len(done)} MP3s · {total_words:,} words)",
         data=zip_buf.getvalue(),
         file_name="ReadMyPDF_bulk.zip",
         mime="application/zip",
@@ -862,19 +910,19 @@ def render_bulk_results() -> None:
         type="primary",
     )
 
-    st.markdown("**Or download individually:**")
+    st.markdown("**Individual downloads:**")
 
-    # Per-file download buttons in a grid (3 columns)
+    # Per-file in 3-column grid
     cols = st.columns(3)
     for i, r in enumerate(done):
-        col = cols[i % 3]
-        with col:
-            dur_secs = len(r["audio"]) / 16_000.0
-            mins = int(dur_secs) // 60
-            secs = int(dur_secs) % 60
-            label_name = r["name"][:25] + "…" if len(r["name"]) > 25 else r["name"]
-            col.download_button(
-                label=f"⬇️ {label_name}\n{r['words']:,} words · {mins}:{secs:02d}",
+        with cols[i % 3]:
+            dur_secs   = len(r["audio"]) / 16_000.0
+            mins       = int(dur_secs) // 60
+            secs       = int(dur_secs) % 60
+            short_name = r["name"][:22] + "…" if len(r["name"]) > 22 else r["name"]
+            lang_tag   = r.get("lang_tag", r.get("lang", ""))
+            st.download_button(
+                label=f"⬇️ {short_name} | {lang_tag} · {r['words']:,}w · {mins}:{secs:02d}",
                 data=r["audio"],
                 file_name=r["filename"],
                 mime="audio/mpeg",
@@ -950,10 +998,49 @@ def main() -> None:
                 f"{len(bulk_files)} file(s) selected — "
                 f"{sum(f.size for f in bulk_files) / (1024*1024):.1f} MB total"
             )
-            # Show file list
             with st.expander(f"Files ({len(bulk_files)})"):
-                for f in bulk_files:
-                    st.caption(f"• {f.name} ({f.size/1024:.0f} KB)")
+                for bf in bulk_files:
+                    st.caption(f"• {bf.name} ({bf.size/1024:.0f} KB)")
+
+            # ── Language mode selector (bulk-specific) ────────────────── #
+            st.markdown("**🌐 Output Language**")
+            bulk_lang_mode = st.radio(
+                "Output language",
+                options=[
+                    "Keep original (per-file auto-detect)",
+                    "Normalize to one language (skip if already matches)",
+                    "Translate all to one language",
+                ],
+                index=0,
+                key="bulk_lang_mode",
+                label_visibility="collapsed",
+                help=(
+                    "• Keep original — each PDF stays in its own detected language. No translation.\n"
+                    "• Normalize — translate only PDFs not already in the target language.\n"
+                    "• Translate all — always translate every PDF to the target language."
+                ),
+            )
+
+            # Language picker shown for normalize/translate modes
+            bulk_target_lang = "en"
+            if bulk_lang_mode != "Keep original (per-file auto-detect)":
+                all_langs  = Config.get_all_language_labels()  # {code: label}
+                lang_codes = list(all_langs.keys())
+                lang_labels = list(all_langs.values())
+                default_idx = lang_codes.index("en") if "en" in lang_codes else 0
+                chosen_label = st.selectbox(
+                    "Target language",
+                    options=lang_labels,
+                    index=default_idx,
+                    key="bulk_target_lang_select",
+                )
+                bulk_target_lang = lang_codes[lang_labels.index(chosen_label)]
+
+            bulk_settings = {
+                **settings,
+                "bulk_lang_mode":  bulk_lang_mode,
+                "bulk_target_lang": bulk_target_lang,
+            }
 
             if st.button(
                 f"🎙️ Convert {len(bulk_files)} PDFs to Audio",
@@ -961,7 +1048,7 @@ def main() -> None:
                 use_container_width=True,
             ):
                 st.session_state.bulk_results = []
-                run_bulk_pipeline(bulk_files, settings)
+                run_bulk_pipeline(bulk_files, bulk_settings)
 
         render_bulk_results()
         return   # Don't render single-PDF UI in bulk mode

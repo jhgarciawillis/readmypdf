@@ -525,11 +525,6 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
     st.session_state.document_structure = document_structure
     st.session_state.extraction_result  = extraction_result
     st.session_state.pdf_bytes          = pdf_bytes
-    # Reset detected_lang when new file is loaded so pre-scan runs fresh
-    st.session_state.detected_lang      = None
-    # Also clear the widget state so the selector defaults correctly
-    if "lang_selector_value" in st.session_state:
-        del st.session_state["lang_selector_value"]
     st.session_state.settings           = settings
     st.session_state.chapter_status     = chapter_status
     st.session_state.processing_done    = True
@@ -767,6 +762,20 @@ def main() -> None:
                     pdf_bytes = f.read()
             except OSError as e:
                 UIComponents.render_error(f"Could not read file: {e}")
+
+    # Store pdf_bytes in session state immediately on upload so the
+    # pre-scan language detection runs BEFORE the sidebar renders on the
+    # next rerun. Also clear detected_lang so detection runs fresh.
+    if pdf_bytes is not None:
+        prev_bytes = st.session_state.get("pdf_bytes")
+        if prev_bytes != pdf_bytes:
+            # New file uploaded — store immediately and rerun
+            # so the sidebar pre-scan fires before next render
+            st.session_state.pdf_bytes     = pdf_bytes
+            st.session_state.detected_lang = None
+            if "lang_selector_value" in st.session_state:
+                del st.session_state["lang_selector_value"]
+            st.rerun()
 
     # Pre-processing summary (shown as soon as PDF is loaded)
     if pdf_bytes is not None:

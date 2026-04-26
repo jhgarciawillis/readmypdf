@@ -196,27 +196,41 @@ class UIComponents:
         effective_max = max(max_pages, 1)
         col1, col2   = st.columns(2)
 
-        # Persist the correct end-page default in session state so that
-        # when the sidebar re-renders with the real page count, the
-        # "To page" field shows the last page — not 1.
-        # Streamlit clamps number_input value to [min, max] on first render,
-        # so if max_pages=1 initially, value would be clamped to 1.
-        # Using session state bypasses this.
-        ss_key = "page_range_end_default"
-        if effective_max > 1:
-            # Update session state whenever we have a real page count
-            st.session_state[ss_key] = effective_max
-        stored_default = st.session_state.get(ss_key, effective_max)
-        # Clamp stored default to current valid range
-        default_end = min(max(stored_default, 1), effective_max)
+        # Use keyed session state for both inputs so Streamlit doesn't
+        # override values between reruns. The keys let us set the values
+        # programmatically (e.g., when a new PDF is loaded with 18 pages,
+        # we push 18 directly into the "To page" widget state).
+        END_KEY   = "page_end_input"
+        START_KEY = "page_start_input"
+
+        # When a new PDF is loaded (or page count changes), push the
+        # correct default directly into the widget state.
+        stored_max = st.session_state.get("last_known_max_pages", 1)
+        if effective_max != stored_max:
+            st.session_state["last_known_max_pages"] = effective_max
+            # Default "To page" to last page of document
+            st.session_state[END_KEY]   = effective_max
+            st.session_state[START_KEY] = 1
+
+        # Ensure keys exist with valid values
+        if END_KEY not in st.session_state:
+            st.session_state[END_KEY] = effective_max
+        if START_KEY not in st.session_state:
+            st.session_state[START_KEY] = 1
+
+        # Clamp to valid range (in case PDF changed to fewer pages)
+        if st.session_state[END_KEY] > effective_max:
+            st.session_state[END_KEY] = effective_max
+        if st.session_state[START_KEY] > effective_max:
+            st.session_state[START_KEY] = 1
 
         with col1:
             start_page = st.number_input(
                 "From page",
                 min_value=1,
                 max_value=effective_max,
-                value=1,
                 step=1,
+                key=START_KEY,
                 help="First page to process (1-indexed, inclusive).",
             )
         with col2:
@@ -224,8 +238,8 @@ class UIComponents:
                 "To page",
                 min_value=1,
                 max_value=effective_max,
-                value=default_end,
                 step=1,
+                key=END_KEY,
                 help=(
                     f"Last page to process. PDF has {effective_max} pages. "
                     "Auto-extends if a chapter boundary is detected mid-range."

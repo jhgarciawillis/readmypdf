@@ -569,7 +569,7 @@ def render_results() -> None:
         st.session_state.current_chapter = current_chapter
 
     # Status banners
-    UIComponents.render_processing_status(mode_used, page_count)
+    UIComponents.render_extraction_mode_banner(mode_used, page_count)
 
     if st.session_state.get("detected_lang"):
         UIComponents.render_detected_language_banner(
@@ -838,15 +838,25 @@ def main() -> None:
 
         st.caption(f"File: {size_mb:.2f} MB · {page_count} pages")
 
-        UIComponents.render_pre_processing_summary(
-            total_pages=page_count,
+        # Estimate audio duration and processing time
+        est_audio_min = est_words / 150       # minutes of audio at 150 wpm
+        est_tts_mins  = max(1, est_chapters)  # rough: ~1 min TTS per chapter
+        est_time_range = (
+            f"{est_tts_mins}–{est_tts_mins * 2} min"
+            if est_tts_mins > 1
+            else "0–1 min"
+        )
+        UIComponents.render_preprocessing_summary(
+            size_mb=size_mb,
+            page_count=page_count,
             selected_pages=selected_pages,
-            chapters_found=chapters_for_summary,
-            est_minutes=est_minutes,
-            est_audio_hrs=est_audio_hrs,
+            chapter_list=chapters_for_summary,
+            est_audio_min=est_audio_min,
+            est_time_range=est_time_range,
+            mode_hint="text",
             warnings=warnings,
-            extended_end=recommended_end,
-            original_end=end_pg,
+            start_page=start_pg,
+            end_page=end_pg,
         )
 
         st.divider()

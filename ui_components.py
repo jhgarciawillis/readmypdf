@@ -585,13 +585,29 @@ class UIComponents:
 
     @staticmethod
     def render_audio_player(
-        audio_data:     dict,
-        current_chapter: str,
-        chapters:       OrderedDict,
-        page_ranges:    dict = None,
+        audio_data:      dict   = None,
+        current_chapter: str    = "",
+        chapters:        OrderedDict = None,
+        page_ranges:     dict   = None,
+        # Legacy params (from older streamlit_app versions)
+        audio_bytes:     bytes  = None,
+        chapter_title:   str    = "",
+        chapter_index:   int    = 0,
+        total_chapters:  int    = 1,
     ) -> None:
-        """Audio player for the current chapter."""
-        chapter_audio = audio_data.get(current_chapter, b"")
+        """Audio player for the current chapter. Accepts both old and new call signatures."""
+        # Handle legacy call: render_audio_player(audio_bytes=..., chapter_title=...)
+        if audio_bytes is not None:
+            if not audio_bytes:
+                st.info("Audio not yet generated for this chapter.")
+                return
+            st.audio(audio_bytes, format="audio/mp3")
+            if chapter_title:
+                st.caption(f"**{chapter_title}** · Chapter {chapter_index + 1} of {total_chapters}")
+            return
+
+        # New call: render_audio_player(audio_data=..., current_chapter=..., chapters=...)
+        chapter_audio = (audio_data or {}).get(current_chapter, b"")
         if not chapter_audio:
             st.info("Audio not yet generated for this chapter.")
             return
@@ -602,11 +618,9 @@ class UIComponents:
             if p1 > 0:
                 page_label = f" · pp. {p1}–{p2}" if p1 != p2 else f" · p. {p1}"
 
-        word_count = len((chapters.get(current_chapter) or "").split())
+        word_count = len(((chapters or {}).get(current_chapter) or "").split())
         st.audio(chapter_audio, format="audio/mp3")
-        st.caption(
-            f"**{current_chapter}**{page_label} · {word_count:,} words"
-        )
+        st.caption(f"**{current_chapter}**{page_label} · {word_count:,} words")
 
     @staticmethod
     def render_audio_adjustment_panel(
@@ -1011,6 +1025,161 @@ class UIComponents:
             st.markdown("**💬 Top Keywords**")
             kw_parts = [f"**{w}** ({ct})" for w, ct in keywords[:15]]
             st.write("  •  ".join(kw_parts))
+
+
+    # ================================================================== #
+    # SECTION 5D — ADDITIONAL DISPLAY METHODS                             #
+    # ================================================================== #
+
+    @staticmethod
+    def render_page_range_warning(
+        original_end: int,
+        extended_end: int,
+        chapters_cut: list,
+    ) -> None:
+        """Banner when page range was auto-extended to avoid cutting a chapter."""
+        if extended_end > original_end:
+            ch_names = ", ".join(
+                f"'{w.get("chapter", "")}'" for w in chapters_cut[:3]
+            )
+            st.info(
+                f"⚡ Page range auto-extended: {original_end} → {extended_end} "
+                f"to avoid cutting chapter(s): {ch_names}."
+            )
+
+    @staticmethod
+    def render_completeness_report(
+        incomplete_pages:    set,
+        incomplete_chapters: set,
+        total_pages:         int = 0,
+        total_chapters:      int = 0,
+    ) -> None:
+        """Alias for render_completeness_banner with extra params ignored."""
+        UIComponents.render_completeness_banner(incomplete_pages, incomplete_chapters)
+
+    @staticmethod
+    def render_metadata(metadata: dict) -> None:
+        """Show PDF metadata (title, author, etc.) if meaningful."""
+        if not metadata:
+            return
+        title  = (metadata.get("title")  or "").strip()
+        author = (metadata.get("author") or "").strip()
+        if not title and not author:
+            return
+        parts = []
+        if title:
+            parts.append(f"**Title:** {title}")
+        if author:
+            parts.append(f"**Author:** {author}")
+        st.caption("  ·  ".join(parts))
+
+    @staticmethod
+    def render_pdf_preview(pdf_bytes: bytes) -> None:
+        """Show a PDF title extracted from metadata."""
+        if not pdf_bytes:
+            return
+        try:
+            import fitz
+            doc   = fitz.open(stream=pdf_bytes, filetype="pdf")
+            meta  = doc.metadata
+            doc.close()
+            title = (meta.get("title") or "").strip()
+            if title:
+                st.caption(f"Title: {title}")
+        except Exception:
+            pass
+
+    @staticmethod
+    def render_cost_estimate(chapters: OrderedDict, tts_engine: str) -> None:
+        """Show OpenAI cost estimate. No-op for gTTS (free)."""
+        if tts_engine != "openai":
+            return
+        total_chars = sum(len(t) for t in chapters.values())
+        cost_usd    = (total_chars / 1000) * 0.015  # $0.015 per 1k chars
+        st.caption(
+            f"💰 Estimated OpenAI TTS cost: ~${cost_usd:.3f} "
+            f"({total_chars:,} chars × $0.015/1k)"
+        )
+
+    @staticmethod
+    def render_table_of_contents(
+        chapters:       OrderedDict,
+        current_chapter: str,
+        page_ranges:    dict = None,
+        chapter_status: dict = None,
+    ) -> None:
+        """Clickable TOC in the left column."""
+        st.markdown("**📑 Chapters**")
+        status_icons = {"done": "✅", "processing": "⏳", "failed": "❌",
+                        "queued": "⬜", "removed": "🗑️"}
+        for title in chapters.keys():
+            status  = (chapter_status or {}).get(title, "done")
+            icon    = status_icons.get(status, "✅")
+            display = title if len(title) <= 30 else title[:27] + "…"
+
+            page_label = ""
+            if page_ranges and title in page_ranges:
+                p1, p2 = page_ranges[title]
+                if p1 > 0:
+                    page_label = f" · pp. {p1}–{p2}"
+
+            word_count = len((chapters.get(title) or "").split())
+            is_current = title == current_chapter
+
+            if is_current:
+                st.markdown(f"**▶ {icon} {display}**")
+            else:
+                if st.button(
+                    f"{icon} {display}",
+                    key=f"toc_{hash(title) % 99999}",
+                    use_container_width=True,
+                ):
+                    st.session_state.current_chapter = title
+                    st.rerun()
+            st.caption(f"{page_label} · {word_count:,} words".lstrip(" · "))
+
+    @staticmethod
+    def render_bookmarks_list(chapters: OrderedDict) -> None:
+        """List bookmarks with jump buttons."""
+        bookmarks = st.session_state.get("bookmarks", [])
+        audio_data = st.session_state.get("audio_data", {})
+        pdf_title  = st.session_state.get("pdf_title", "")
+        UIComponents.render_bookmarks_panel(
+            audio_data=audio_data,
+            bookmarks=bookmarks,
+            chapters=chapters,
+            pdf_title=pdf_title,
+        )
+
+    @staticmethod
+    def render_chapter_navigation(chapters: OrderedDict, current_chapter: str) -> None:
+        """Previous / Next chapter buttons."""
+        chapter_list = list(chapters.keys())
+        if len(chapter_list) <= 1:
+            return
+        idx    = chapter_list.index(current_chapter) if current_chapter in chapter_list else 0
+        c1, c2 = st.columns(2)
+        with c1:
+            if idx > 0:
+                if st.button("⬅️ Previous", use_container_width=True, key="nav_prev"):
+                    st.session_state.current_chapter = chapter_list[idx - 1]
+                    st.rerun()
+        with c2:
+            if idx < len(chapter_list) - 1:
+                if st.button("Next ➡️", use_container_width=True, key="nav_next"):
+                    st.session_state.current_chapter = chapter_list[idx + 1]
+                    st.rerun()
+
+    @staticmethod
+    def render_progress(current_chapter: str, chapters: OrderedDict) -> None:
+        """Show chapter N of M progress."""
+        chapter_list = list(chapters.keys())
+        if not chapter_list:
+            return
+        idx   = chapter_list.index(current_chapter) if current_chapter in chapter_list else 0
+        total = len(chapter_list)
+        st.caption(f"Chapter {idx + 1} of {total}")
+        st.progress((idx + 1) / total)
 
     # ================================================================== #
     # SECTION 8 — FEEDBACK / ERROR RENDERING                              #

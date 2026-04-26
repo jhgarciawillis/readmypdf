@@ -331,91 +331,33 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
     logger.info(f"[STAGE 8] Page ranges: {page_ranges}")
 
     # ------------------------------------------------------------------ #
-    # STAGE 9: Post-hoc incomplete page detection and removal              #
+    # STAGE 9: Completeness verification (report only — no removal)        #
     # ------------------------------------------------------------------ #
+    # We no longer remove pages or chapters automatically. Fingerprint
+    # verification was causing too many false positives (references pages
+    # with URLs, last pages of well-formed PDFs) and silently destroying
+    # content. The user can see the completeness report and decide what
+    # to do. The pipeline always uses the full extracted content.
     incomplete_pages    = set()
     incomplete_chapters = set()
 
-    if remove_incomplete_pages:
-        with st.spinner("Verifying page completeness via word fingerprinting…"):
-            # Use pre-translation chapters for fingerprint matching.
-            # Fingerprints come from original-language blocks, so they must
-            # be compared against original-language text, not translated text.
-            chapters_for_fp = st.session_state.get("chapters_for_fingerprint") or chapters
-            logger.info(f"[STAGE 9] Running incomplete page detection on {len(chapters_for_fp)} chapters...")
-            incomplete_pages = TextAnalyzer.flag_incomplete_pages(blocks, chapters_for_fp)
-            st.session_state.incomplete_pages = incomplete_pages
-            logger.info(f"[STAGE 9] Incomplete pages flagged: {[p+1 for p in sorted(incomplete_pages)]}")
-
-            if incomplete_pages:
-                # Only remove incomplete pages if we won't lose most content
-                total_pages_in_blocks = len(set(b.get("page_num",0) for b in blocks))
-                pct_flagged = len(incomplete_pages) / max(total_pages_in_blocks, 1)
-                if pct_flagged > 0.5:
-                    # More than 50% of pages flagged = fingerprint unreliable
-                    # (likely single-chapter doc where last page = last page of doc)
-                    logger.warning(
-                        f"[STAGE 9] SAFETY: {pct_flagged:.0%} of pages flagged "
-                        f"({len(incomplete_pages)}/{total_pages_in_blocks}) — "
-                        f"likely false positives. Skipping removal to preserve content."
-                    )
-                    st.session_state.incomplete_pages = set()
-                    incomplete_pages = set()
-                else:
-                    clean_blocks = [
-                        b for b in blocks
-                        if b.get("page_num") not in incomplete_pages
-                    ]
-                    rebuilt = TextAnalyzer.build_document_structure(
-                        blocks=clean_blocks,
-                        lang_code=lang_code,
-                        remove_headers=remove_hf,
-                    )
-                    # Safety: only use rebuilt if it has substantial content
-                    rebuilt_text = " ".join(rebuilt["chapters"].values())
-                    original_text = " ".join(chapters.values())
-                    pct_kept = len(rebuilt_text) / max(len(original_text), 1)
-                    logger.info(f"[STAGE 9] Rebuild: original={len(original_text.split())} words, rebuilt={len(rebuilt_text.split())} words ({pct_kept:.0%} kept)")
-                    if len(rebuilt_text) > len(original_text) * 0.3:
-                        chapters                       = rebuilt["chapters"]
-                        document_structure["chapters"] = chapters
-                        logger.info(f"[STAGE 9] Removed content from {len(incomplete_pages)} incomplete pages. New chapters: {len(chapters)}")
-                        for t, tx in chapters.items():
-                            logger.info(f"[STAGE 9]   '{t[:50]}': {len(tx.split())} words")
-                    else:
-                        logger.warning(
-                            f"[STAGE 9] SAFETY: Rebuild would lose {1-pct_kept:.0%} of content — skipping removal."
-                        )
-                        st.session_state.incomplete_pages = set()
-                        incomplete_pages = set()
-
-    # ------------------------------------------------------------------ #
-    # STAGE 10: Post-hoc incomplete chapter detection and removal          #
-    # ------------------------------------------------------------------ #
-    if remove_incomplete_chapters:
-        with st.spinner("Verifying chapter completeness…"):
-            logger.info(f"[STAGE 10] Running incomplete chapter detection...")
-            chapters_for_fp = st.session_state.get("chapters_for_fingerprint") or chapters
+    chapters_for_fp = st.session_state.get("chapters_for_fingerprint") or chapters
+    if chapters_for_fp:
+        try:
+            incomplete_pages    = TextAnalyzer.flag_incomplete_pages(blocks, chapters_for_fp)
             incomplete_chapters = TextAnalyzer.flag_incomplete_chapters(blocks, chapters_for_fp)
-            st.session_state.incomplete_chapters = incomplete_chapters
-            logger.info(f"[STAGE 10] Incomplete chapters flagged: {list(incomplete_chapters)}")
+        except Exception as e:
+            logger.warning(f"Completeness verification failed: {e}")
 
-            if incomplete_chapters:
-                # Only remove if it won't wipe everything
-                if len(incomplete_chapters) >= len(chapters):
-                    logger.warning(
-                        "Incomplete chapter detection would remove all chapters — skipping."
-                    )
-                    st.session_state.incomplete_chapters = set()
-                    incomplete_chapters = set()
-                else:
-                    before_count = len(chapters)
-                    chapters     = OrderedDict(
-                        (t, v) for t, v in chapters.items()
-                        if t not in incomplete_chapters
-                    )
-                    document_structure["chapters"] = chapters
-                    logger.info(f"Removed {before_count - len(chapters)} incomplete chapters.")
+    st.session_state.incomplete_pages    = incomplete_pages
+    st.session_state.incomplete_chapters = incomplete_chapters
+
+    if incomplete_pages:
+        pg_nums = ", ".join(str(p+1) for p in sorted(incomplete_pages))
+        logger.info(
+            f"[STAGE 9] Completeness report: pages {pg_nums} may be truncated "
+            f"(fingerprint check). No content removed — full text used."
+        )
 
     if not chapters:
         UIComponents.render_error(

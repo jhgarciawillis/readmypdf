@@ -296,31 +296,15 @@ class UIComponents:
             help="Display NLP KPIs, readability scores, keyword density, and more.",
         )
 
-        with st.expander("Content completeness"):
-            st.caption(
-                "These options verify and enforce that only fully captured pages "
-                "and chapters are included in the audio output. Verification uses "
-                "word fingerprinting: the last few words of each page are checked "
-                "against the assembled text."
-            )
-            remove_inc_pages = st.toggle(
-                "Remove incomplete pages",
-                value=False,
-                help=(
-                    "Remove pages whose last words are not found in the assembled "
-                    "text — typically cut-off pages at PDF boundaries."
-                ),
-            )
-            remove_inc_chapters = st.toggle(
-                "Remove incomplete chapters",
-                value=False,
-                help=(
-                    "Remove chapters whose last page failed fingerprint verification. "
-                    "More aggressive than page removal."
-                ),
-            )
+        # Completeness verification runs automatically and is shown as an
+        # informational report — content is never removed automatically.
+        st.caption(
+            "💡 Completeness fingerprinting runs automatically and is shown "
+            "in the results — content is never removed."
+        )
 
-        return remove_hf, show_analysis, remove_inc_pages, remove_inc_chapters
+        # Return False for the removed toggles so callers don't break
+        return remove_hf, show_analysis, False, False
 
     # ================================================================== #
     # SECTION 2 — FILE INPUT                                              #
@@ -463,6 +447,12 @@ class UIComponents:
         incomplete_pages:    set,
         incomplete_chapters: set,
     ) -> None:
+        """
+        Completeness report — informational only. Content is NEVER removed.
+        Fingerprint verification flags pages/chapters whose last words could
+        not be matched in the assembled text (often references with URLs,
+        last pages of well-formed PDFs, or multilingual documents).
+        """
         if not incomplete_pages and not incomplete_chapters:
             st.success(
                 "✅ Completeness verified — all pages and chapters passed "
@@ -474,23 +464,22 @@ class UIComponents:
         if incomplete_pages:
             pg_nums = ", ".join(str(p + 1) for p in sorted(incomplete_pages))
             items.append(
-                f"{len(incomplete_pages)} page(s) removed "
-                f"(fingerprint not found in assembled text): pages {pg_nums}"
+                f"Page(s) {pg_nums} — fingerprint could not be verified "
+                f"(often caused by reference/URL-heavy pages)."
             )
         if incomplete_chapters:
-            items.append(
-                f"{len(incomplete_chapters)} chapter(s) removed "
-                f"(incomplete): {', '.join(sorted(incomplete_chapters))}"
-            )
+            ch_names = ", ".join(f"'{t}'" for t in sorted(incomplete_chapters))
+            items.append(f"Chapter(s) {ch_names} — last page fingerprint unverified.")
 
-        total_ch   = st.session_state.get("total_chapters_before_removal", "?")
-        remain_ch  = st.session_state.get("total_chapters_after_removal", "?")
-
-        body = "⚠️ Completeness report:\n\n"
+        body = "ℹ️ Completeness note (audio is unaffected — full content included):\n\n"
         for item in items:
-            body += f"* {item}\n"
-        body += f"Audio covers {remain_ch} of {total_ch} detected chapters."
-        st.warning(body)
+            body += f"• {item}\n"
+        body += (
+            "\nThis is informational only. No content was removed. "
+            "If you see missing text in the audio, try disabling "
+            "'Remove headers & footers' or check the page range."
+        )
+        st.info(body)
 
     # ================================================================== #
     # SECTION 5 — CHAPTER QUEUE                                           #
@@ -686,10 +675,15 @@ class UIComponents:
 
     @staticmethod
     def _apply_audio_adjustments(audio_bytes: bytes) -> bytes:
-        """Apply current speed/pitch settings to audio bytes. Returns adjusted bytes."""
+        """Apply current speed/pitch settings to audio bytes. Returns adjusted bytes.
+        
+        Reads from widget session state keys directly — always reflects
+        what the user currently has the sliders set to.
+        """
         from audio_generator import AudioGenerator
-        speed = st.session_state.get("_audio_adj_speed", 1.0)
-        pitch = st.session_state.get("_audio_adj_pitch", 1.0)
+        # Read from widget keys (most reliable — always in sync with slider)
+        speed = float(st.session_state.get("adj_speed_slider", 1.0))
+        pitch = float(st.session_state.get("adj_pitch_slider", 1.0))
         result = audio_bytes
         if abs(speed - 1.0) > 0.02:
             result = AudioGenerator.apply_speed(result, speed)
@@ -1054,7 +1048,7 @@ class UIComponents:
         total_pages:         int = 0,
         total_chapters:      int = 0,
     ) -> None:
-        """Alias for render_completeness_banner with extra params ignored."""
+        """Alias for render_completeness_banner."""
         UIComponents.render_completeness_banner(incomplete_pages, incomplete_chapters)
 
     @staticmethod

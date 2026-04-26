@@ -498,7 +498,8 @@ class TextCleaner:
                 "No font size data available (likely OCR mode). "
                 "Heading detection skipped — will use regex fallback."
             )
-            return []
+            # Return full blocks list unchanged (no headings marked)
+            return blocks
 
         median_size = statistics.median(font_sizes)
         ratio = Config.HEADING_SIZE_RATIO
@@ -581,6 +582,11 @@ class TextCleaner:
             else:
                 level = 3
 
+            # Mark the original block in-place so split_into_chapters
+            # can find heading boundaries by checking is_heading=True
+            block["is_heading"]    = True
+            block["heading_level"] = level
+
             headings.append({
                 "text":     text,
                 "level":    level,
@@ -592,7 +598,10 @@ class TextCleaner:
             )
 
         logger.info(f"Heading extraction: found {len(headings)} headings.")
-        return headings
+        # Return the FULL blocks list (with is_heading flags set), NOT just headings.
+        # Returning only headings was a critical bug: split_into_chapters would
+        # receive a 1-item list and produce a 7-word chapter instead of 3229 words.
+        return blocks
 
     # ================================================================== #
     # SECTION 4 — TTS TEXT CLEANING PIPELINE                             #

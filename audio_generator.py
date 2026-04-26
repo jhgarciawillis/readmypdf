@@ -275,78 +275,128 @@ class AudioGenerator:
     @staticmethod
     def apply_speed(audio_bytes: bytes, rate: float) -> bytes:
         """
-        Change playback speed of an MP3 using pydub frame-rate trick.
-        
-        Method: override frame_rate to original * rate (speeds up playback),
-        then set frame_rate back to original (correct duration in player).
-        This correctly changes tempo without changing pitch.
-        
-        Requires pydub + ffmpeg (both available on Streamlit Cloud).
-        Falls back to original bytes if unavailable.
+        Change playback speed using ffmpeg atempo filter.
+        Works on Python 3.14+ (no pydub/audioop dependency).
+        atempo range is 0.5–2.0; values outside are chained.
+        Returns original bytes unchanged on error or rate ≈ 1.0.
         """
+        import subprocess, tempfile, os
         rate = max(0.25, min(4.0, rate))
         if 0.97 <= rate <= 1.03:
             return audio_bytes
 
+        # Build chained atempo filters for values outside 0.5–2.0
+        filters, r = [], rate
+        while r > 2.0:
+            filters.append("atempo=2.0")
+            r /= 2.0
+        while r < 0.5:
+            filters.append("atempo=0.5")
+            r *= 2.0
+        filters.append(f"atempo={r:.4f}")
+        filter_str = ",".join(filters)
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as fi:
+            fi.write(audio_bytes)
+            in_path = fi.name
+        out_path = in_path + "_spd.mp3"
+
         try:
-            from pydub import AudioSegment
-            buf = io.BytesIO(audio_bytes)
-            audio = AudioSegment.from_mp3(buf)
-            # Speed up: raise frame_rate by rate factor, then normalize
-            sped = audio._spawn(
-                audio.raw_data,
-                overrides={"frame_rate": int(audio.frame_rate * rate)}
-            ).set_frame_rate(audio.frame_rate)
-            out = io.BytesIO()
-            sped.export(out, format="mp3", bitrate="128k")
-            out.seek(0)
-            result = out.read()
-            logger.debug(
-                f"apply_speed: {rate}x — "
-                f"{len(audio_bytes)//1024}KB → {len(result)//1024}KB"
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", in_path,
+                 "-filter:a", filter_str,
+                 "-acodec", "libmp3lame", "-q:a", "4", out_path],
+                capture_output=True, timeout=60,
             )
-            return result
+            if result.returncode != 0:
+                logger.warning(
+                    f"ffmpeg speed change failed: "
+                    f"{result.stderr[-300:].decode('utf-8', errors='replace')}"
+                )
+                return audio_bytes
+            with open(out_path, "rb") as f:
+                adjusted = f.read()
+            logger.debug(
+                f"apply_speed {rate:.2f}x: "
+                f"{len(audio_bytes)//1024}KB → {len(adjusted)//1024}KB"
+            )
+            return adjusted
         except Exception as e:
-            logger.warning(f"apply_speed failed ({e}) — returning original")
+            logger.warning(f"apply_speed error: {e}")
             return audio_bytes
+        finally:
+            for p in [in_path, out_path]:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
     @staticmethod
     def apply_pitch(audio_bytes: bytes, pitch: float) -> bytes:
         """
-        Shift pitch of an MP3 independently of tempo using pydub.
-        
-        Method: override frame_rate to original * pitch (shifts pitch up/down),
-        then DON'T normalize — so duration changes with pitch.
-        To keep tempo constant while shifting pitch, combine with speed adjust.
-        
-        Requires pydub + ffmpeg. Falls back to original bytes if unavailable.
+        Shift pitch independently of tempo using ffmpeg asetrate+aresample+atempo.
+        asetrate shifts pitch (and tempo), aresample restores sample rate,
+        atempo compensates tempo back to original duration.
+        Works on Python 3.14+ (no pydub/audioop dependency).
+        Returns original bytes unchanged on error or pitch ≈ 1.0.
         """
+        import subprocess, tempfile, os
         pitch = max(0.25, min(4.0, pitch))
         if 0.97 <= pitch <= 1.03:
             return audio_bytes
 
+        sample_rate = 44100
+        new_rate    = int(sample_rate * pitch)
+        # atempo compensation = 1/pitch, chained if outside 0.5–2.0
+        atempo_val  = 1.0 / pitch
+        atempo_filters, t = [], atempo_val
+        while t < 0.5:
+            atempo_filters.append("atempo=0.5")
+            t /= 0.5
+        while t > 2.0:
+            atempo_filters.append("atempo=2.0")
+            t /= 2.0
+        atempo_filters.append(f"atempo={t:.4f}")
+        filter_str = (
+            f"asetrate={new_rate},"
+            f"aresample={sample_rate},"
+            + ",".join(atempo_filters)
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as fi:
+            fi.write(audio_bytes)
+            in_path = fi.name
+        out_path = in_path + "_pit.mp3"
+
         try:
-            from pydub import AudioSegment
-            buf = io.BytesIO(audio_bytes)
-            audio = AudioSegment.from_mp3(buf)
-            # Pitch shift: change frame_rate (shifts pitch AND tempo together)
-            # then compensate tempo back to original
-            shifted = audio._spawn(
-                audio.raw_data,
-                overrides={"frame_rate": int(audio.frame_rate * pitch)}
-            ).set_frame_rate(audio.frame_rate)
-            out = io.BytesIO()
-            shifted.export(out, format="mp3", bitrate="128k")
-            out.seek(0)
-            result = out.read()
-            logger.debug(
-                f"apply_pitch: {pitch}x — "
-                f"{len(audio_bytes)//1024}KB → {len(result)//1024}KB"
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", in_path,
+                 "-filter:a", filter_str,
+                 "-acodec", "libmp3lame", "-q:a", "4", out_path],
+                capture_output=True, timeout=60,
             )
-            return result
+            if result.returncode != 0:
+                logger.warning(
+                    f"ffmpeg pitch shift failed: "
+                    f"{result.stderr[-300:].decode('utf-8', errors='replace')}"
+                )
+                return audio_bytes
+            with open(out_path, "rb") as f:
+                adjusted = f.read()
+            logger.debug(
+                f"apply_pitch {pitch:.2f}x: "
+                f"{len(audio_bytes)//1024}KB → {len(adjusted)//1024}KB"
+            )
+            return adjusted
         except Exception as e:
-            logger.warning(f"apply_pitch failed ({e}) — returning original")
+            logger.warning(f"apply_pitch error: {e}")
             return audio_bytes
+        finally:
+            for p in [in_path, out_path]:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
 
     @staticmethod

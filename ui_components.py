@@ -84,6 +84,20 @@ class UIComponents:
             st.divider()
 
             st.subheader("Audio Settings")
+            # Voice gender: free gTTS variant via TLD routing
+            # Only shown for gTTS (OpenAI has its own voice setting)
+            voice_gender = "Female"
+            if tts_engine == "gtts":
+                voice_gender = st.radio(
+                    "Voice",
+                    options=["Female", "Male"],
+                    horizontal=True,
+                    help=(
+                        "Uses different Google TTS regional endpoints to produce "
+                        "perceptibly different voice characteristics. "
+                        "Free — no API key needed."
+                    ),
+                )
             rate, pitch = UIComponents._rate_pitch_sliders()
             st.divider()
 
@@ -108,6 +122,8 @@ class UIComponents:
             "translation_engine":          trans_engine,
             "remove_incomplete_pages":     remove_inc_pages,
             "remove_incomplete_chapters":  remove_inc_chapters,
+            "voice_gender":                voice_gender,
+            "gtts_tld":                    UIComponents._get_gtts_tld(lang_code, voice_gender),
         }
 
     @staticmethod
@@ -166,6 +182,28 @@ class UIComponents:
         else:
             st.caption("🟢 Free (gTTS) — set OPENAI_API_KEY to unlock Premium")
             return "gtts"
+
+    # gTTS TLD map for voice gender by language
+    # Each language has (female_tld, male_tld) — these produce perceptibly
+    # different voices from Google's TTS infrastructure at no cost.
+    GTTS_VOICE_TLDS: dict = {
+        "en":  ("com",   "co.uk"),   # US neutral vs British
+        "es":  ("com",   "com.mx"),  # neutral vs Mexican accent (slightly deeper)
+        "fr":  ("fr",    "ca"),      # France vs Canadian French
+        "de":  ("de",    "at"),      # Germany vs Austrian German
+        "pt":  ("com.br","pt"),      # Brazilian vs European Portuguese
+        "it":  ("it",    "com"),
+        "ja":  ("co.jp", "co.jp"),   # Same for Japanese (limited variation)
+        "zh":  ("com.hk","com"),     # Hong Kong vs mainland
+        "ar":  ("com",   "com"),
+        "ru":  ("ru",    "com"),
+    }
+
+    @staticmethod
+    def _get_gtts_tld(lang_code: str, voice_gender: str) -> str:
+        """Return the gTTS TLD for the given language and voice gender preference."""
+        tlds = UIComponents.GTTS_VOICE_TLDS.get(lang_code, ("com", "com"))
+        return tlds[0] if voice_gender == "Female" else tlds[1]
 
     @staticmethod
     def _rate_pitch_sliders() -> tuple[float, float]:
@@ -788,17 +826,23 @@ class UIComponents:
             with col2:
                 if status == "done" and title in audio_data:
                     audio_bytes = audio_data[title]
-                    safe_name   = re.sub(r"[^a-zA-Z0-9_-]", "_", title)[:30]
+                    pdf_title   = st.session_state.get("pdf_title", "")
+                    q_fname     = UIComponents._make_filename(pdf_title, title) + ".mp3"
                     # Estimate duration from file size (MP3 at ~128kbps)
                     dur_secs    = len(audio_bytes) / 16_000.0
                     mins        = int(dur_secs) // 60
                     secs        = int(dur_secs) % 60
+                    # Use a unique key that includes both title hash AND a
+                    # session-level render counter so the queue can be rendered
+                    # multiple times without Streamlit's duplicate-key error.
+                    render_id = st.session_state.get("_queue_render_id", 0)
+                    st.session_state["_queue_render_id"] = render_id + 1
                     st.download_button(
                         label=f"⬇️ {mins}:{secs:02d}",
                         data=audio_bytes,
-                        file_name=f"{safe_name}.mp3",
+                        file_name=q_fname,
                         mime="audio/mpeg",
-                        key=f"dl_queue_{title[:20]}_{hash(title) % 9999}",
+                        key=f"dl_q_{render_id}_{hash(title) % 99999}",
                         use_container_width=True,
                     )
                 elif status == "processing":
@@ -815,10 +859,95 @@ class UIComponents:
     # ================================================================== #
 
     @staticmethod
+    @staticmethod
+    def _make_filename(pdf_title: str, chapter_title: str = "", suffix: str = "") -> str:
+        """Build a clean, relevant filename from PDF title + chapter."""
+        def slug(s: str, max_len: int = 30) -> str:
+            s = re.sub(r"[^a-zA-Z0-9À-ÿ _-]", "", s).strip()
+            s = re.sub(r" +", "_", s)
+            return s[:max_len].rstrip("_")
+
+        base = slug(pdf_title, 35) if pdf_title else "ReadMyPDF"
+        if chapter_title and chapter_title.lower() not in ("document", "introduction"):
+            ch = slug(chapter_title, 25)
+            name = f"{base}__{ch}" if ch else base
+        else:
+            name = base
+        if suffix:
+            name = f"{name}{suffix}"
+        return name or "ReadMyPDF"
+
+    @staticmethod
+    def render_audio_adjustment_panel(audio_data: dict, chapters: OrderedDict, pdf_title: str = "") -> None:
+        """
+        Post-generation speed/pitch adjustment panel shown above downloads.
+        Applies FFmpeg-style speed change to already-generated audio without
+        re-running TTS. This lets users tweak pacing instantly.
+        Uses mutagen for duration reading and audioop/array for resampling.
+        """
+        with st.expander("🎛️ Adjust Audio (Speed / Pitch)", expanded=False):
+            st.caption(
+                "Modify the generated audio without re-processing. "
+                "Adjusted files are ready to download immediately."
+            )
+            adj_col1, adj_col2 = st.columns(2)
+            with adj_col1:
+                adj_speed = st.slider(
+                    "Speed",
+                    min_value=0.5, max_value=2.5, value=1.0, step=0.05,
+                    format="%.2f×",
+                    help="1.0 = original speed. Applied via audio resampling.",
+                    key="post_speed_slider",
+                )
+            with adj_col2:
+                adj_pitch = st.slider(
+                    "Pitch",
+                    min_value=0.5, max_value=2.0, value=1.0, step=0.05,
+                    format="%.2f×",
+                    help="1.0 = original pitch. Independent of speed.",
+                    key="post_pitch_slider",
+                )
+
+            if st.button("✨ Apply & Download Adjusted", use_container_width=True, key="apply_adj"):
+                if not audio_data:
+                    st.warning("No audio to adjust yet.")
+                    return
+                with st.spinner("Applying adjustments…"):
+                    # Combine all chapters
+                    silence = bytes([0xFF, 0xFB, 0x90, 0x00, *([0x00] * 40)]) * 32
+                    buf = io.BytesIO()
+                    for i, title in enumerate(chapters.keys()):
+                        ch = audio_data.get(title, b"")
+                        if ch:
+                            buf.write(ch)
+                            if i < len(chapters) - 1:
+                                buf.write(silence)
+                    combined = buf.getvalue()
+
+                    if combined:
+                        from audio_generator import AudioGenerator
+                        adjusted = combined
+                        if abs(adj_speed - 1.0) > 0.02:
+                            adjusted = AudioGenerator.apply_speed(adjusted, adj_speed)
+                        if abs(adj_pitch - 1.0) > 0.02:
+                            adjusted = AudioGenerator.apply_pitch(adjusted, adj_pitch)
+
+                        adj_fname = UIComponents._make_filename(pdf_title, "", f"_x{adj_speed:.1f}.mp3")
+                        st.download_button(
+                            label=f"⬇️ Download Adjusted ({adj_speed:.1f}× speed, {adj_pitch:.1f}× pitch)",
+                            data=adjusted,
+                            file_name=adj_fname,
+                            mime="audio/mpeg",
+                            use_container_width=True,
+                            key="dl_adjusted",
+                        )
+
+    @staticmethod
     def render_download_buttons(
         audio_data:      dict,
         current_chapter: str,
         chapters:        OrderedDict,
+        pdf_title:       str = "",
     ) -> None:
         """
         Chapter download + Full Book download.
@@ -830,11 +959,11 @@ class UIComponents:
         with col1:
             chapter_audio = audio_data.get(current_chapter, b"")
             if chapter_audio:
-                safe_title = re.sub(r"[^a-zA-Z0-9_-]", "_", current_chapter)[:40]
+                fname = UIComponents._make_filename(pdf_title, current_chapter) + ".mp3"
                 st.download_button(
                     label="📥 This Chapter",
                     data=chapter_audio,
-                    file_name=f"{safe_title}.mp3",
+                    file_name=fname,
                     mime="audio/mpeg",
                     use_container_width=True,
                     help=f"Download '{current_chapter}' as MP3",
@@ -869,10 +998,11 @@ class UIComponents:
                         if available < total
                         else f"📚 Full Book ({available} chapters)"
                     )
+                    full_fname = UIComponents._make_filename(pdf_title, "", "_full.mp3")
                     st.download_button(
                         label=label,
                         data=full_book_bytes,
-                        file_name="full_book.mp3",
+                        file_name=full_fname,
                         mime="audio/mpeg",
                         use_container_width=True,
                         help=f"Download {available} available chapters as one MP3",

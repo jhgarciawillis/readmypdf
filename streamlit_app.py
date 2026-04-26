@@ -56,6 +56,7 @@ def initialize_session_state() -> None:
         "processing_done":         False,
         "settings":                {},
         "detected_lang":           None,
+        "pdf_title":               "",
         "translation_engine_used": None,
         "chapter_status":          {},
         "page_ranges":             {},
@@ -87,6 +88,7 @@ def _reset_pipeline_state() -> None:
     st.session_state.page_ranges             = {}
     st.session_state.incomplete_pages        = set()
     st.session_state.chapters_for_fingerprint = None
+    st.session_state["_queue_render_id"]      = 0
     st.session_state.incomplete_chapters     = set()
     st.session_state.pre_scan_warnings       = []
     st.session_state.original_end_page       = None
@@ -480,6 +482,7 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
                 rate=rate,
                 pitch=pitch,
                 engine=tts_engine,
+                tld=settings.get("gtts_tld", "com"),
             )
             audio_data[chapter_title]          = audio_bytes
             chapter_status[chapter_title]      = "done"
@@ -645,10 +648,16 @@ def render_results() -> None:
         st.divider()
         UIComponents.render_progress(current_chapter, chapters)
         st.divider()
+        UIComponents.render_audio_adjustment_panel(
+            audio_data=audio_data,
+            chapters=chapters,
+            pdf_title=st.session_state.get("pdf_title", ""),
+        )
         UIComponents.render_download_buttons(
             audio_data=audio_data,
             current_chapter=current_chapter,
             chapters=chapters,
+            pdf_title=st.session_state.get("pdf_title", ""),
         )
 
     # Analysis panel
@@ -771,6 +780,16 @@ def main() -> None:
         if prev_bytes != pdf_bytes:
             # New file uploaded — store immediately and rerun
             # so the sidebar pre-scan fires before next render
+            # Extract PDF title from metadata for meaningful download filenames
+            try:
+                import fitz as _fitz_t
+                _doc_t    = _fitz_t.open(stream=pdf_bytes, filetype="pdf")
+                _meta     = _doc_t.metadata
+                _doc_t.close()
+                _pdf_title = (_meta.get("title") or "").strip()
+            except Exception:
+                _pdf_title = ""
+            st.session_state.pdf_title     = _pdf_title
             st.session_state.pdf_bytes     = pdf_bytes
             st.session_state.detected_lang = None
             if "lang_selector_value" in st.session_state:

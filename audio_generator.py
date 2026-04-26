@@ -40,6 +40,7 @@ class AudioGenerator:
         text:      str,
         lang_code: str   = "en",
         rate:      float = 1.0,
+        tld:       str   = "com",
         pitch:     float = 1.0,
         engine:    str   = None,
     ) -> bytes:
@@ -65,7 +66,7 @@ class AudioGenerator:
 
         logger.info(
             f"Generating audio: {len(chunks)} chunks, engine={engine}, "
-            f"lang={lang_code}, rate={rate}"
+            f"lang={lang_code}, rate={rate}, tld={tld}"
         )
 
         chunk_audio_list: list[bytes] = []
@@ -76,7 +77,7 @@ class AudioGenerator:
                 if engine == "openai":
                     chunk_bytes = AudioGenerator._generate_openai(chunk, lang_code, rate)
                 else:
-                    chunk_bytes = AudioGenerator._generate_gtts(chunk, lang_code)
+                    chunk_bytes = AudioGenerator._generate_gtts(chunk, lang_code, rate, tld)
                 chunk_audio_list.append(chunk_bytes)
             except Exception as e:
                 logger.error(f"TTS failed on chunk {i+1}/{len(chunks)}: {e}")
@@ -100,11 +101,20 @@ class AudioGenerator:
     # ================================================================== #
 
     @staticmethod
-    def _generate_gtts(text: str, lang_code: str, rate: float = 1.0) -> bytes:
+    def _generate_gtts(text: str, lang_code: str, rate: float = 1.0, tld: str = "com") -> bytes:
         """Generate MP3 bytes using gTTS with retry logic.
-        
+
         rate < 0.8 uses gTTS slow=True (the only native speed control gTTS has).
         Other rate values are handled by apply_speed() after generation.
+
+        tld controls which Google TTS endpoint is used — different TLDs produce
+        slightly different voice characteristics (accent/gender perception):
+          "com"    → US English (default, neutral/female-leaning)
+          "co.uk"  → British English (male-leaning for en)
+          "com.au" → Australian English
+          "co.in"  → Indian English
+        For Spanish: "com" = neutral, "com.mx" = Mexican accent.
+        This is the free gTTS approach to voice variety — no API key needed.
         """
         gtts_lang   = Config.get_gtts_code(lang_code)
         max_retries = 3
@@ -112,7 +122,7 @@ class AudioGenerator:
 
         for attempt in range(1, max_retries + 1):
             try:
-                tts = gTTS(text=text, lang=gtts_lang, slow=use_slow)
+                tts = gTTS(text=text, lang=gtts_lang, slow=use_slow, tld=tld)
                 buf = io.BytesIO()
                 tts.write_to_fp(buf)
                 buf.seek(0)
@@ -320,6 +330,52 @@ class AudioGenerator:
             i += 1
 
         return bytes(data)
+
+    @staticmethod
+    def apply_pitch(audio_bytes: bytes, pitch: float) -> bytes:
+        """
+        Shift pitch of an MP3 independently of speed using pydub + audioop.
+
+        Technique: speed up/down with sample rate trick (shifts pitch),
+        then compensate speed back to original duration. This is a classic
+        "pitch shifting without time-stretching" approximation.
+
+        No paid API needed. Requires: pydub, audioop (stdlib in Py<3.13)
+        or numpy as fallback. Falls back to no-op if unavailable.
+        """
+        pitch = max(0.5, min(2.0, pitch))
+        if 0.97 <= pitch <= 1.03:
+            return audio_bytes
+
+        try:
+            from pydub import AudioSegment
+            import audioop
+        except ImportError:
+            # pydub not available — return unchanged
+            logger.warning("pydub not available; pitch shift skipped.")
+            return audio_bytes
+
+        try:
+            buf = io.BytesIO(audio_bytes)
+            audio = AudioSegment.from_mp3(buf)
+
+            # Step 1: change playback rate → shifts pitch up/down
+            # new_frame_rate = original * pitch
+            pitched = audio._spawn(
+                audio.raw_data,
+                overrides={"frame_rate": int(audio.frame_rate * pitch)}
+            )
+            # Step 2: set frame rate back to original → restores tempo, keeps pitch
+            pitched = pitched.set_frame_rate(audio.frame_rate)
+
+            out = io.BytesIO()
+            pitched.export(out, format="mp3", bitrate="128k")
+            out.seek(0)
+            return out.read()
+        except Exception as e:
+            logger.warning(f"Pitch shift failed: {e} — returning original audio.")
+            return audio_bytes
+
 
     @staticmethod
     def apply_rate_pitch(

@@ -84,6 +84,7 @@ def _reset_pipeline_state() -> None:
     st.session_state.chapter_status          = {}
     st.session_state.page_ranges             = {}
     st.session_state.incomplete_pages        = set()
+    st.session_state.chapters_for_fingerprint = None
     st.session_state.incomplete_chapters     = set()
     st.session_state.pre_scan_warnings       = []
     st.session_state.original_end_page       = None
@@ -297,6 +298,12 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
                     logger.warning(f"[STAGE 7] Translation failed for '{ch_title}': {e} — keeping original")
                     translated[ch_title] = ch_text
 
+            # Save pre-translation chapters for fingerprint verification.
+            # Fingerprints are extracted from the ORIGINAL language blocks,
+            # so they must be compared against the original language text.
+            # Comparing against translated text would always fail.
+            st.session_state.chapters_for_fingerprint = dict(chapters)
+
             chapters                               = translated
             document_structure["chapters"]         = chapters
             st.session_state.translation_engine_used = engine_used
@@ -327,8 +334,12 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
 
     if remove_incomplete_pages:
         with st.spinner("Verifying page completeness via word fingerprinting…"):
-            logger.info(f"[STAGE 9] Running incomplete page detection on {len(chapters)} chapters...")
-            incomplete_pages = TextAnalyzer.flag_incomplete_pages(blocks, chapters)
+            # Use pre-translation chapters for fingerprint matching.
+            # Fingerprints come from original-language blocks, so they must
+            # be compared against original-language text, not translated text.
+            chapters_for_fp = st.session_state.get("chapters_for_fingerprint") or chapters
+            logger.info(f"[STAGE 9] Running incomplete page detection on {len(chapters_for_fp)} chapters...")
+            incomplete_pages = TextAnalyzer.flag_incomplete_pages(blocks, chapters_for_fp)
             st.session_state.incomplete_pages = incomplete_pages
             logger.info(f"[STAGE 9] Incomplete pages flagged: {[p+1 for p in sorted(incomplete_pages)]}")
 
@@ -380,7 +391,8 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
     if remove_incomplete_chapters:
         with st.spinner("Verifying chapter completeness…"):
             logger.info(f"[STAGE 10] Running incomplete chapter detection...")
-            incomplete_chapters = TextAnalyzer.flag_incomplete_chapters(blocks, chapters)
+            chapters_for_fp = st.session_state.get("chapters_for_fingerprint") or chapters
+            incomplete_chapters = TextAnalyzer.flag_incomplete_chapters(blocks, chapters_for_fp)
             st.session_state.incomplete_chapters = incomplete_chapters
             logger.info(f"[STAGE 10] Incomplete chapters flagged: {list(incomplete_chapters)}")
 

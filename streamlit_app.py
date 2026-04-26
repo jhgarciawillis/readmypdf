@@ -730,31 +730,38 @@ def run_bulk_pipeline(uploaded_files: list, settings: dict) -> None:
                     status_placeholder.error(f"❌ **{display_name}** — {err}")
                 continue
 
-            # Detect language
+            # Extract all pages
             page_count = PDFProcessor.get_page_count(pdf_bytes)
             mode       = TextCleaner.detect_pdf_mode(pdf_bytes)
 
-            blocks = PDFProcessor.extract_text_blocks(
+            extraction = PDFProcessor.extract(
                 pdf_bytes=pdf_bytes,
-                mode=mode,
-                lang_code="es",        # detect below
+                lang_code="en",      # preliminary; re-detected below
                 start_page=1,
                 end_page=page_count,
+                mode=mode,
             )
+            blocks = extraction["blocks"]
 
-            full_text = " ".join(b.get("text", "") for b in blocks)
-            if not full_text.strip():
+            # Quick language detection on raw text
+            raw_text = " ".join(b.get("text", "") for b in blocks)
+            if not raw_text.strip():
                 raise ValueError("No text extracted from PDF")
 
-            # Auto-detect language per PDF
-            detected_lang = Translator.detect_language(full_text[:1000]) or "es"
+            detected_lang = Translator.detect_language(raw_text[:1000]) or "en"
             lang_code = detected_lang
 
-            # Apply header/footer removal
-            if remove_hf:
-                blocks = TextCleaner.filter_blocks(blocks, remove_headers_footers=True)
+            # Build document structure (handles header/footer removal internally)
+            doc_structure = TextAnalyzer.build_document_structure(
+                blocks=blocks,
+                lang_code=lang_code,
+                remove_headers=remove_hf,
+            )
+            chapters = doc_structure.get("chapters", {})
+            full_text = " ".join(chapters.values()).strip()
 
-            full_text = " ".join(b.get("text", "") for b in blocks).strip()
+            if not full_text:
+                raise ValueError("No text after processing")
 
             # Translate if requested
             audio_lang = lang_code

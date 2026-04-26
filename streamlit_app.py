@@ -1,3 +1,5 @@
+import re
+import io
 """
 streamlit_app.py
 ================
@@ -66,6 +68,7 @@ def initialize_session_state() -> None:
         "original_end_page":       None,
         "extended_end_page":       None,
         "chapters_found_prescan":  [],
+        "bulk_results":            [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -698,8 +701,48 @@ def main() -> None:
     st.title(f"🎧 {Config.APP_NAME}")
     st.caption(Config.DESCRIPTION)
 
-    # File input
+    # Mode toggle: Single PDF or Bulk
     st.subheader("Upload PDF")
+    upload_mode = st.radio(
+        "Mode",
+        options=["Single PDF", "Bulk (multiple PDFs)"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="upload_mode_radio",
+    )
+
+    # ── BULK MODE ─────────────────────────────────────────────────────── #
+    if upload_mode == "Bulk (multiple PDFs)":
+        bulk_files = st.file_uploader(
+            "Upload PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+            help="Upload multiple PDFs. Each will be converted to a separate MP3.",
+        )
+
+        if bulk_files:
+            st.caption(
+                f"{len(bulk_files)} file(s) selected — "
+                f"{sum(f.size for f in bulk_files) / (1024*1024):.1f} MB total"
+            )
+            # Show file list
+            with st.expander(f"Files ({len(bulk_files)})"):
+                for f in bulk_files:
+                    st.caption(f"• {f.name} ({f.size/1024:.0f} KB)")
+
+            if st.button(
+                f"🎙️ Convert {len(bulk_files)} PDFs to Audio",
+                type="primary",
+                use_container_width=True,
+            ):
+                st.session_state.bulk_results = []
+                run_bulk_pipeline(bulk_files, settings)
+
+        render_bulk_results()
+        return   # Don't render single-PDF UI in bulk mode
+
+    # ── SINGLE MODE ───────────────────────────────────────────────────── #
     file_source = st.radio(
         "File source",
         options=["Upload file", "Local file"],
@@ -858,3 +901,219 @@ Russian, Chinese, Japanese, Arabic, Hindi, Portuguese, Dutch.
 
 if __name__ == "__main__":
     main()
+
+
+# ================================================================== #
+# BULK MODE PIPELINE                                                   #
+# ================================================================== #
+
+def _get_pdf_display_name(filename: str, pdf_bytes: bytes) -> str:
+    """Extract a clean display name from PDF metadata or filename."""
+    try:
+        import fitz
+        doc   = fitz.open(stream=pdf_bytes, filetype="pdf")
+        title = (doc.metadata.get("title") or "").strip()
+        doc.close()
+        if title and len(title) > 4:
+            return title
+    except Exception:
+        pass
+    # Fallback: clean up filename
+    name = filename.rsplit(".", 1)[0]          # strip .pdf
+    name = re.sub(r"[_-]+", " ", name).strip()
+    return name[:80]
+
+
+def run_bulk_pipeline(uploaded_files: list, settings: dict) -> None:
+    """
+    Process multiple PDFs sequentially → one MP3 per PDF.
+    Results stored in st.session_state.bulk_results as:
+        [{"name": str, "filename": str, "audio": bytes, "words": int,
+          "status": "done"|"error", "error_msg": str}, ...]
+    """
+    if "bulk_results" not in st.session_state:
+        st.session_state.bulk_results = []
+
+    tts_engine  = settings["tts_engine"]
+    translate   = settings.get("translate", False)
+    target_lang = settings.get("target_lang", "en")
+    trans_engine = settings.get("translation_engine", "auto")
+    remove_hf   = settings.get("remove_headers_footers", True)
+
+    total = len(uploaded_files)
+    progress_bar = st.progress(0.0, text=f"0/{total} PDFs processed")
+    results_container = st.container()
+
+    results: list = []
+
+    for idx, uploaded_file in enumerate(uploaded_files):
+        pdf_bytes = uploaded_file.read()
+        raw_name  = uploaded_file.name
+        display_name = _get_pdf_display_name(raw_name, pdf_bytes)
+
+        progress_bar.progress(
+            idx / total,
+            text=f"Processing {idx+1}/{total}: {display_name[:40]}…"
+        )
+
+        with results_container:
+            status_placeholder = st.empty()
+            status_placeholder.info(f"⏳ **{display_name}** — processing…")
+
+        try:
+            # Validate
+            valid, err = PDFProcessor.validate_pdf(pdf_bytes)
+            if not valid:
+                results.append({
+                    "name": display_name, "filename": raw_name,
+                    "audio": b"", "words": 0,
+                    "status": "error", "error_msg": err,
+                })
+                with results_container:
+                    status_placeholder.error(f"❌ **{display_name}** — {err}")
+                continue
+
+            # Detect language
+            page_count = PDFProcessor.get_page_count(pdf_bytes)
+            mode       = TextCleaner.detect_pdf_mode(pdf_bytes)
+
+            blocks = PDFProcessor.extract_text_blocks(
+                pdf_bytes=pdf_bytes,
+                mode=mode,
+                lang_code="es",        # detect below
+                start_page=1,
+                end_page=page_count,
+            )
+
+            full_text = " ".join(b.get("text", "") for b in blocks)
+            if not full_text.strip():
+                raise ValueError("No text extracted from PDF")
+
+            # Auto-detect language per PDF
+            detected_lang = Translator.detect_language(full_text[:1000]) or "es"
+            lang_code = detected_lang
+
+            # Apply header/footer removal
+            if remove_hf:
+                blocks = TextCleaner.filter_blocks(blocks, remove_headers_footers=True)
+
+            full_text = " ".join(b.get("text", "") for b in blocks).strip()
+
+            # Translate if requested
+            audio_lang = lang_code
+            if translate and target_lang and target_lang != lang_code:
+                translated, engine_used = Translator.translate_text(
+                    text=full_text,
+                    source_lang=lang_code,
+                    target_lang=target_lang,
+                    engine=trans_engine,
+                )
+                if "original" not in engine_used:
+                    full_text  = translated
+                    audio_lang = target_lang
+
+            word_count = len(full_text.split())
+            if word_count < 5:
+                raise ValueError(f"Too few words extracted ({word_count})")
+
+            # Generate audio — voice gender from session state
+            _voice_gender = st.session_state.get("voice_gender_radio", "Female")
+            _tld = UIComponents._get_gtts_tld(audio_lang, _voice_gender)
+
+            audio_bytes = AudioGenerator.generate_audio(
+                text=full_text,
+                lang_code=audio_lang,
+                rate=1.0,
+                pitch=1.0,
+                engine=tts_engine,
+                tld=_tld,
+            )
+
+            results.append({
+                "name":      display_name,
+                "filename":  raw_name.rsplit(".", 1)[0] + ".mp3",
+                "audio":     audio_bytes,
+                "words":     word_count,
+                "lang":      audio_lang,
+                "status":    "done",
+                "error_msg": "",
+            })
+
+            dur_secs = len(audio_bytes) / 16_000.0
+            mins = int(dur_secs) // 60
+            secs = int(dur_secs) % 60
+            with results_container:
+                status_placeholder.success(
+                    f"✅ **{display_name}** — {word_count:,} words · {mins}:{secs:02d}"
+                )
+
+        except Exception as exc:
+            logger.error(f"Bulk: error processing '{raw_name}': {exc}")
+            results.append({
+                "name": display_name, "filename": raw_name,
+                "audio": b"", "words": 0,
+                "status": "error", "error_msg": str(exc),
+            })
+            with results_container:
+                status_placeholder.error(f"❌ **{display_name}** — {exc}")
+
+    progress_bar.progress(1.0, text=f"✅ Done — {total} PDFs processed")
+    st.session_state.bulk_results = results
+
+
+def render_bulk_results() -> None:
+    """Show per-PDF download buttons and a bulk ZIP download."""
+    results = st.session_state.get("bulk_results", [])
+    if not results:
+        return
+
+    done    = [r for r in results if r["status"] == "done"]
+    errors  = [r for r in results if r["status"] == "error"]
+
+    st.markdown("---")
+    st.subheader(f"📦 Results — {len(done)} of {len(results)} converted")
+
+    if errors:
+        with st.expander(f"⚠️ {len(errors)} failed"):
+            for r in errors:
+                st.error(f"**{r['name']}** — {r['error_msg']}")
+
+    if not done:
+        return
+
+    # Bulk ZIP download
+    import zipfile
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for r in done:
+            zf.writestr(r["filename"], r["audio"])
+    zip_buf.seek(0)
+
+    st.download_button(
+        label=f"📦 Download All as ZIP ({len(done)} MP3s)",
+        data=zip_buf.getvalue(),
+        file_name="ReadMyPDF_bulk.zip",
+        mime="application/zip",
+        use_container_width=True,
+        type="primary",
+    )
+
+    st.markdown("**Or download individually:**")
+
+    # Per-file download buttons in a grid (3 columns)
+    cols = st.columns(3)
+    for i, r in enumerate(done):
+        col = cols[i % 3]
+        with col:
+            dur_secs = len(r["audio"]) / 16_000.0
+            mins = int(dur_secs) // 60
+            secs = int(dur_secs) % 60
+            label_name = r["name"][:25] + "…" if len(r["name"]) > 25 else r["name"]
+            col.download_button(
+                label=f"⬇️ {label_name}\n{r['words']:,} words · {mins}:{secs:02d}",
+                data=r["audio"],
+                file_name=r["filename"],
+                mime="audio/mpeg",
+                key=f"bulk_dl_{i}_{hash(r['filename']) % 99999}",
+                use_container_width=True,
+            )

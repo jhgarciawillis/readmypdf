@@ -79,7 +79,9 @@ def _reset_pipeline_state() -> None:
     st.session_state.extraction_result       = None
     st.session_state.current_chapter         = None
     st.session_state.bookmarks               = []
-    st.session_state.detected_lang           = None
+    # NOTE: detected_lang is NOT reset here — it persists from the pre-scan
+    # so the sidebar language selector keeps showing the detected language.
+    # It only resets when a new file is uploaded.
     st.session_state.translation_engine_used = None
     st.session_state.chapter_status          = {}
     st.session_state.page_ranges             = {}
@@ -523,6 +525,11 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
     st.session_state.document_structure = document_structure
     st.session_state.extraction_result  = extraction_result
     st.session_state.pdf_bytes          = pdf_bytes
+    # Reset detected_lang when new file is loaded so pre-scan runs fresh
+    st.session_state.detected_lang      = None
+    # Also clear the widget state so the selector defaults correctly
+    if "lang_selector_value" in st.session_state:
+        del st.session_state["lang_selector_value"]
     st.session_state.settings           = settings
     st.session_state.chapter_status     = chapter_status
     st.session_state.processing_done    = True

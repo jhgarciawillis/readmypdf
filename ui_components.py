@@ -116,20 +116,32 @@ class UIComponents:
         label_list = list(labels.values())
         code_list  = list(labels.keys())
 
-        # Reflect auto-detected language if set
-        default_idx = 0
-        if st.session_state.get("detected_lang"):
-            detected = st.session_state.detected_lang
-            if detected in code_list:
-                default_idx = code_list.index(detected)
+        # When pre-scan detects a language, push it directly into the
+        # selectbox session state key so the widget reflects it immediately
+        # on the SAME render (not just the next one).
+        # st.selectbox with index= only works on first render; after that
+        # the widget owns its state. Using a key + direct session state
+        # assignment is the correct Streamlit pattern.
+        WIDGET_KEY = "lang_selector_value"
+        detected = st.session_state.get("detected_lang")
+        if detected and detected in code_list:
+            detected_label = label_list[code_list.index(detected)]
+            # Only push if different from what's currently shown
+            current = st.session_state.get(WIDGET_KEY)
+            if current != detected_label:
+                st.session_state[WIDGET_KEY] = detected_label
+
+        # Default to English if nothing set yet
+        if WIDGET_KEY not in st.session_state:
+            st.session_state[WIDGET_KEY] = label_list[0]
 
         selected_label = st.selectbox(
             "Document language",
             options=label_list,
-            index=default_idx,
+            key=WIDGET_KEY,
             help=(
                 "Language of the source PDF. Used for OCR accuracy and TTS voice. "
-                "Auto-detection will override this if enabled."
+                "Auto-detection runs on upload and updates this automatically."
             ),
         )
         return code_list[label_list.index(selected_label)]

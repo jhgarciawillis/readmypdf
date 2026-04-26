@@ -234,50 +234,49 @@ class UIComponents:
     @staticmethod
     def _page_range_selector(max_pages: int) -> tuple[int, int]:
         effective_max = max(max_pages, 1)
-        col1, col2   = st.columns(2)
 
-        END_KEY   = "page_end_input"
-        START_KEY = "page_start_input"
-
-        stored_max = st.session_state.get("last_known_max_pages", 1)
+        # Detect when the PDF changes (different page count) and reset
+        # widget states. Critically: we must DELETE the widget keys from
+        # session state before rendering, not just overwrite them —
+        # Streamlit ignores ss writes to already-rendered widget keys
+        # within the same script run.
+        stored_max = st.session_state.get("_prs_last_max", 0)
         if effective_max != stored_max:
-            st.session_state["last_known_max_pages"] = effective_max
-            st.session_state[END_KEY]   = effective_max
-            st.session_state[START_KEY] = 1
+            st.session_state["_prs_last_max"] = effective_max
+            # Delete keys so Streamlit treats them as fresh on next render
+            for key in ("page_end_input", "page_start_input"):
+                if key in st.session_state:
+                    del st.session_state[key]
+            # Set desired defaults — will be picked up since keys are fresh
+            st.session_state["page_end_input"]   = effective_max
+            st.session_state["page_start_input"] = 1
 
-        if END_KEY not in st.session_state:
-            st.session_state[END_KEY] = effective_max
-        if START_KEY not in st.session_state:
-            st.session_state[START_KEY] = 1
-
-        if st.session_state[END_KEY] > effective_max:
-            st.session_state[END_KEY] = effective_max
-        if st.session_state[START_KEY] > effective_max:
-            st.session_state[START_KEY] = 1
-
+        col1, col2 = st.columns(2)
         with col1:
             start_page = st.number_input(
-                "From page", min_value=1, max_value=effective_max,
-                step=1, key=START_KEY,
+                "From page",
+                min_value=1,
+                max_value=effective_max,
+                step=1,
+                key="page_start_input",
                 help="First page to process (1-indexed, inclusive).",
             )
         with col2:
             end_page = st.number_input(
-                "To page", min_value=1, max_value=effective_max,
-                step=1, key=END_KEY,
-                help=(
-                    f"Last page to process. PDF has {effective_max} pages. "
-                    "Auto-extends if a chapter boundary is detected mid-range."
-                ),
+                "To page",
+                min_value=1,
+                max_value=effective_max,
+                step=1,
+                key="page_end_input",
+                help=f"Last page to process. PDF has {effective_max} pages.",
             )
 
-        if effective_max > 1:
-            selected = int(end_page) - int(start_page) + 1
-            st.caption(
-                f"{effective_max} pages total · {selected} selected "
-                + ("· Full document" if selected == effective_max
-                   else f"· Pages {int(start_page)}–{int(end_page)}")
-            )
+        selected = int(end_page) - int(start_page) + 1
+        st.caption(
+            f"{effective_max} pages total · {selected} selected "
+            + ("· Full document" if selected == effective_max
+               else f"· Pages {int(start_page)}–{int(end_page)}")
+        )
         return int(start_page), int(end_page)
 
     @staticmethod
@@ -618,60 +617,46 @@ class UIComponents:
         pdf_title:  str = "",
     ) -> None:
         """
-        Post-generation speed/pitch panel shown between the player and downloads.
-
-        Design rationale:
-        - Speed/pitch are listener preferences, not content properties.
-        - The user can't know their ideal rate until they've heard the audio.
-        - Post-gen adjustment avoids re-running TTS (expensive) for what is
-          essentially a playback preference.
-        - Sidebar is kept clean for content-relevant settings only.
-
-        Speed: changes playback rate via MP3 sample-rate header rewrite (pure Python).
-        Pitch: uses pydub frame-rate trick if pydub is available; else skipped.
-        Both are applied to the combined audio at download time, not in the player.
+        Post-generation speed/pitch adjustment panel.
+        Always visible (not in expander) so users can see and interact with it.
+        Sliders update session state → download buttons below re-render with
+        adjusted audio in the same pass (no extra click needed).
         """
-        st.markdown("**🎛️ Audio Adjustments**")
-        st.caption(
-            "Tweak speed and pitch after generation — no re-processing needed. "
-            "Downloads below reflect your current settings."
-        )
+        st.markdown("**🎛️ Playback Adjustments**")
 
         adj_col1, adj_col2 = st.columns(2)
         with adj_col1:
             adj_speed = st.slider(
-                "Speed",
+                "⚡ Speed",
                 min_value=0.5, max_value=2.5,
-                value=st.session_state.get("adj_speed", 1.0),
+                value=1.0,
                 step=0.05, format="%.2f×",
                 key="adj_speed_slider",
-                help="1.0 = original speed. Applied at download time.",
+                help="1.0 = original. Changes tempo without re-generating audio.",
             )
         with adj_col2:
             adj_pitch = st.slider(
-                "Pitch",
+                "🎵 Pitch",
                 min_value=0.5, max_value=2.0,
-                value=st.session_state.get("adj_pitch", 1.0),
+                value=1.0,
                 step=0.05, format="%.2f×",
                 key="adj_pitch_slider",
-                help="1.0 = original pitch. Independent of speed.",
+                help="1.0 = original. Shifts voice pitch up or down.",
             )
-
-        st.session_state["adj_speed"] = adj_speed
-        st.session_state["adj_pitch"] = adj_pitch
 
         speed_changed = abs(adj_speed - 1.0) > 0.02
         pitch_changed = abs(adj_pitch - 1.0) > 0.02
         if speed_changed or pitch_changed:
             tags = []
             if speed_changed:
-                tags.append(f"{adj_speed:.2f}× speed")
+                faster = adj_speed > 1.0
+                tags.append(f"{adj_speed:.2f}× ({'faster' if faster else 'slower'})")
             if pitch_changed:
-                tags.append(f"{adj_pitch:.2f}× pitch")
-            st.caption(f"✏️ Adjustments active: {', '.join(tags)}")
-
-        st.session_state["_audio_adj_speed"] = adj_speed
-        st.session_state["_audio_adj_pitch"] = adj_pitch
+                higher = adj_pitch > 1.0
+                tags.append(f"pitch {adj_pitch:.2f}× ({'higher' if higher else 'lower'})")
+            st.caption(f"✏️ Active: {' · '.join(tags)} — reflected in downloads below")
+        else:
+            st.caption("Downloads use original audio. Adjust sliders to modify.")
 
     @staticmethod
     def _apply_audio_adjustments(audio_bytes: bytes) -> bytes:

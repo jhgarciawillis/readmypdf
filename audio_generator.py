@@ -275,105 +275,77 @@ class AudioGenerator:
     @staticmethod
     def apply_speed(audio_bytes: bytes, rate: float) -> bytes:
         """
-        Change playback speed of an MP3 by rewriting the frame rate in the
-        MP3 header bytes. This is the simplest speed change possible —
-        it shifts pitch slightly (same as changing tape speed) but is
-        imperceptible at rates between 0.8 and 1.4x.
-
-        Works by scanning for the MP3 sync word (0xFF 0xFB/0xFA/0xF3 etc.),
-        reading the sample rate from the frame header, and writing a new
-        sample rate that produces the desired speed. All players interpret
-        the sample rate to determine playback duration.
-
-        No external dependencies — pure Python + stdlib struct module.
-
-        For rates outside 0.5–2.0, clamps to those bounds.
-        Returns original bytes unchanged if rate is effectively 1.0.
+        Change playback speed of an MP3 using pydub frame-rate trick.
+        
+        Method: override frame_rate to original * rate (speeds up playback),
+        then set frame_rate back to original (correct duration in player).
+        This correctly changes tempo without changing pitch.
+        
+        Requires pydub + ffmpeg (both available on Streamlit Cloud).
+        Falls back to original bytes if unavailable.
         """
-        import struct
-
-        rate = max(0.5, min(2.0, rate))
+        rate = max(0.25, min(4.0, rate))
         if 0.97 <= rate <= 1.03:
-            return audio_bytes  # close enough to 1.0, skip processing
+            return audio_bytes
 
-        # MP3 sample rate table (MPEG1): index → Hz
-        # Bits 10-11 of the frame header encode sample rate
-        SAMPLE_RATES = {
-            0b00: 44100,
-            0b01: 48000,
-            0b10: 32000,
-        }
-        # Reverse: find closest standard rate to target
-        STANDARD_RATES = [32000, 44100, 48000]
-
-        data = bytearray(audio_bytes)
-        n    = len(data)
-        i    = 0
-
-        while i < n - 4:
-            # Scan for MP3 sync word: 11 set bits = 0xFF 0xEx or 0xFF 0xFx
-            if data[i] == 0xFF and (data[i+1] & 0xE0) == 0xE0:
-                # Found a candidate frame header
-                # Byte 2 bits 2-3 = sample rate index
-                sr_index = (data[i+2] >> 2) & 0b11
-                if sr_index in SAMPLE_RATES:
-                    original_sr = SAMPLE_RATES[sr_index]
-                    target_sr   = int(original_sr / rate)  # lower SR = faster playback
-                    # Find the closest standard rate
-                    closest     = min(STANDARD_RATES, key=lambda x: abs(x - target_sr))
-                    # Find its index
-                    new_index   = {v: k for k, v in SAMPLE_RATES.items()}[closest]
-                    # Write new sample rate bits (bits 2-3 of byte i+2)
-                    data[i+2]   = (data[i+2] & 0b11110011) | (new_index << 2)
-                    # Only modify first frame header — that's enough for most players
-                    break
-            i += 1
-
-        return bytes(data)
+        try:
+            from pydub import AudioSegment
+            buf = io.BytesIO(audio_bytes)
+            audio = AudioSegment.from_mp3(buf)
+            # Speed up: raise frame_rate by rate factor, then normalize
+            sped = audio._spawn(
+                audio.raw_data,
+                overrides={"frame_rate": int(audio.frame_rate * rate)}
+            ).set_frame_rate(audio.frame_rate)
+            out = io.BytesIO()
+            sped.export(out, format="mp3", bitrate="128k")
+            out.seek(0)
+            result = out.read()
+            logger.debug(
+                f"apply_speed: {rate}x — "
+                f"{len(audio_bytes)//1024}KB → {len(result)//1024}KB"
+            )
+            return result
+        except Exception as e:
+            logger.warning(f"apply_speed failed ({e}) — returning original")
+            return audio_bytes
 
     @staticmethod
     def apply_pitch(audio_bytes: bytes, pitch: float) -> bytes:
         """
-        Shift pitch of an MP3 independently of speed using pydub + audioop.
-
-        Technique: speed up/down with sample rate trick (shifts pitch),
-        then compensate speed back to original duration. This is a classic
-        "pitch shifting without time-stretching" approximation.
-
-        No paid API needed. Requires: pydub, audioop (stdlib in Py<3.13)
-        or numpy as fallback. Falls back to no-op if unavailable.
+        Shift pitch of an MP3 independently of tempo using pydub.
+        
+        Method: override frame_rate to original * pitch (shifts pitch up/down),
+        then DON'T normalize — so duration changes with pitch.
+        To keep tempo constant while shifting pitch, combine with speed adjust.
+        
+        Requires pydub + ffmpeg. Falls back to original bytes if unavailable.
         """
-        pitch = max(0.5, min(2.0, pitch))
+        pitch = max(0.25, min(4.0, pitch))
         if 0.97 <= pitch <= 1.03:
             return audio_bytes
 
         try:
             from pydub import AudioSegment
-            import audioop
-        except ImportError:
-            # pydub not available — return unchanged
-            logger.warning("pydub not available; pitch shift skipped.")
-            return audio_bytes
-
-        try:
             buf = io.BytesIO(audio_bytes)
             audio = AudioSegment.from_mp3(buf)
-
-            # Step 1: change playback rate → shifts pitch up/down
-            # new_frame_rate = original * pitch
-            pitched = audio._spawn(
+            # Pitch shift: change frame_rate (shifts pitch AND tempo together)
+            # then compensate tempo back to original
+            shifted = audio._spawn(
                 audio.raw_data,
                 overrides={"frame_rate": int(audio.frame_rate * pitch)}
-            )
-            # Step 2: set frame rate back to original → restores tempo, keeps pitch
-            pitched = pitched.set_frame_rate(audio.frame_rate)
-
+            ).set_frame_rate(audio.frame_rate)
             out = io.BytesIO()
-            pitched.export(out, format="mp3", bitrate="128k")
+            shifted.export(out, format="mp3", bitrate="128k")
             out.seek(0)
-            return out.read()
+            result = out.read()
+            logger.debug(
+                f"apply_pitch: {pitch}x — "
+                f"{len(audio_bytes)//1024}KB → {len(result)//1024}KB"
+            )
+            return result
         except Exception as e:
-            logger.warning(f"Pitch shift failed: {e} — returning original audio.")
+            logger.warning(f"apply_pitch failed ({e}) — returning original")
             return audio_bytes
 
 

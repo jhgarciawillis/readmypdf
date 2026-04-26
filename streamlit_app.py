@@ -418,13 +418,21 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
         progress_bar.progress(i / total_chapters, text=f"Generating: '{chapter_title}' ({i+1}/{total_chapters})…")
 
         try:
+            # Re-read voice gender from widget session state right before
+            # generation — more reliable than settings dict which was built
+            # at sidebar render time (may not reflect latest radio selection)
+            _voice_gender = st.session_state.get("voice_gender_radio", "Female")
+            _tld = UIComponents._get_gtts_tld(lang_code, _voice_gender)
+            logger.info(
+                f"[TTS] voice={_voice_gender}, lang={lang_code}, tld={_tld}"
+            )
             audio_bytes = AudioGenerator.generate_audio(
                 text=chapter_text,
                 lang_code=lang_code,
                 rate=rate,
                 pitch=pitch,
                 engine=tts_engine,
-                tld=settings.get("gtts_tld", "com"),
+                tld=_tld,
             )
             audio_data[chapter_title]          = audio_bytes
             chapter_status[chapter_title]      = "done"

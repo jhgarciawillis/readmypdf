@@ -105,8 +105,8 @@ def run_pipeline(pdf_bytes: bytes, settings: dict) -> None:
     """
     lang_code                  = settings["lang_code"]
     tts_engine                 = settings["tts_engine"]
-    rate                       = settings["rate"]
-    pitch                      = settings["pitch"]
+    rate                       = 1.0   # fixed; post-gen adjustment panel handles speed
+    pitch                      = 1.0   # fixed; post-gen adjustment panel handles pitch
     start_page                 = settings["start_page"]
     end_page                   = settings["end_page"]
     remove_hf                  = settings["remove_headers_footers"]

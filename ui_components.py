@@ -1,68 +1,62 @@
 """
 ui_components.py
 ================
-All Streamlit UI rendering. Pure presentation layer.
-Contains zero business logic — takes pre-computed data and renders it.
+All Streamlit UI rendering — sidebar settings, banners, chapter player,
+downloads, audio adjustment, document analysis, bookmarks.
+
+Structure:
+  SECTION 1  — Sidebar settings (language, translation, TTS, page range, options)
+  SECTION 2  — File input widgets
+  SECTION 3  — Pre-processing summary
+  SECTION 4  — Status banners (extraction mode, translation, completeness)
+  SECTION 5  — Chapter queue (live progress + per-chapter downloads)
+  SECTION 5B — Audio player + post-generation adjustment panel
+  SECTION 5C — Download buttons
+  SECTION 6  — Bookmarks
+  SECTION 7  — Document analysis panel
+  SECTION 8  — Feedback / error rendering
 """
 
-import os
 import io
 import re
-import base64
-import logging
 from collections import OrderedDict
-from typing import Optional
 
 import streamlit as st
 
 from config import Config
 
-logger = logging.getLogger(__name__)
-
 
 class UIComponents:
+    """All UI rendering, organised as static methods."""
 
     # ================================================================== #
-    # SECTION 1 — FILE INPUT                                              #
+    # SECTION 1 — SIDEBAR SETTINGS                                        #
     # ================================================================== #
+
+    # gTTS TLD map for voice gender by language.
+    # (female_tld, male_tld) — different Google regional servers produce
+    # perceptibly different voice characteristics at no cost.
+    GTTS_VOICE_TLDS: dict = {
+        "en":  ("com",    "co.uk"),    # US neutral vs British
+        "es":  ("com",    "com.mx"),   # neutral vs Mexican (slightly deeper)
+        "fr":  ("fr",     "ca"),       # France vs Canadian French
+        "de":  ("de",     "at"),       # Germany vs Austrian German
+        "pt":  ("com.br", "pt"),       # Brazilian vs European Portuguese
+        "it":  ("it",     "com"),
+        "ja":  ("co.jp",  "co.jp"),
+        "zh":  ("com.hk", "com"),
+        "ar":  ("com",    "com"),
+        "ru":  ("ru",     "com"),
+    }
 
     @staticmethod
-    def file_uploader_widget() -> Optional[object]:
-        return st.file_uploader(
-            "Upload a PDF file",
-            type=["pdf"],
-            help=(
-                f"Maximum file size: {Config.MAX_PDF_SIZE_MB} MB. "
-                "Text-based PDFs process in seconds; "
-                "scanned PDFs require OCR and take longer."
-            ),
-            label_visibility="collapsed",
-        )
-
-    @staticmethod
-    def local_file_selector(folder_path: str = ".") -> Optional[str]:
-        try:
-            pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith(".pdf")]
-        except OSError:
-            st.warning(f"Cannot read folder: {folder_path}")
-            return None
-
-        if not pdf_files:
-            st.info("No PDF files found in the current folder.")
-            return None
-
-        selected = st.selectbox("Select a PDF file", options=pdf_files, label_visibility="collapsed")
-        return os.path.join(folder_path, selected)
-
-    # ================================================================== #
-    # SECTION 2 — SETTINGS SIDEBAR                                        #
-    # ================================================================== #
+    def _get_gtts_tld(lang_code: str, voice_gender: str) -> str:
+        tlds = UIComponents.GTTS_VOICE_TLDS.get(lang_code, ("com", "com"))
+        return tlds[0] if voice_gender == "Female" else tlds[1]
 
     @staticmethod
     def render_sidebar_settings(max_pages: int = 1) -> dict:
-        """
-        Render all sidebar settings. Returns complete settings dict.
-        """
+        """Render all sidebar settings. Returns complete settings dict."""
         with st.sidebar:
             st.title(Config.APP_NAME)
             st.caption(f"v{Config.VERSION}")
@@ -83,23 +77,24 @@ class UIComponents:
             tts_engine = UIComponents._tts_engine_selector()
             st.divider()
 
-            st.subheader("Audio Settings")
-            # Voice gender: free gTTS variant via TLD routing
-            # Only shown for gTTS (OpenAI has its own voice setting)
+            # Voice gender — only for gTTS (free, no API key)
+            # Uses regional TLD routing to produce slightly different voice
             voice_gender = "Female"
             if tts_engine == "gtts":
+                st.subheader("🎙️ Voice")
                 voice_gender = st.radio(
                     "Voice",
                     options=["Female", "Male"],
                     horizontal=True,
+                    key="voice_gender_radio",
                     help=(
-                        "Uses different Google TTS regional endpoints to produce "
-                        "perceptibly different voice characteristics. "
-                        "Free — no API key needed."
+                        "Different Google TTS regional endpoints produce "
+                        "perceptibly different voices. Free — no API key needed.\n\n"
+                        "• Female: standard Google US/neutral voice\n"
+                        "• Male: regional variant (British EN, Mexican ES, etc.)"
                     ),
                 )
-            rate, pitch = UIComponents._rate_pitch_sliders()
-            st.divider()
+                st.divider()
 
             st.subheader("Page Range")
             start_page, end_page = UIComponents._page_range_selector(max_pages)
@@ -111,8 +106,8 @@ class UIComponents:
         return {
             "lang_code":                   lang_code,
             "tts_engine":                  tts_engine,
-            "rate":                        rate,
-            "pitch":                       pitch,
+            "rate":                        1.0,   # generation rate fixed at 1.0
+            "pitch":                       1.0,   # pitch fixed at 1.0 (post-gen adjustment)
             "start_page":                  start_page,
             "end_page":                    end_page,
             "remove_headers_footers":      remove_hf,
@@ -132,22 +127,13 @@ class UIComponents:
         label_list = list(labels.values())
         code_list  = list(labels.keys())
 
-        # When pre-scan detects a language, push it directly into the
-        # selectbox session state key so the widget reflects it immediately
-        # on the SAME render (not just the next one).
-        # st.selectbox with index= only works on first render; after that
-        # the widget owns its state. Using a key + direct session state
-        # assignment is the correct Streamlit pattern.
         WIDGET_KEY = "lang_selector_value"
         detected = st.session_state.get("detected_lang")
         if detected and detected in code_list:
             detected_label = label_list[code_list.index(detected)]
-            # Only push if different from what's currently shown
-            current = st.session_state.get(WIDGET_KEY)
-            if current != detected_label:
+            if st.session_state.get(WIDGET_KEY) != detected_label:
                 st.session_state[WIDGET_KEY] = detected_label
 
-        # Default to English if nothing set yet
         if WIDGET_KEY not in st.session_state:
             st.session_state[WIDGET_KEY] = label_list[0]
 
@@ -163,100 +149,107 @@ class UIComponents:
         return code_list[label_list.index(selected_label)]
 
     @staticmethod
+    def _translation_settings(source_lang: str) -> tuple:
+        """Translation toggle + engine selection. Returns (translate, target_lang, engine)."""
+        translate = st.toggle(
+            "Translate output",
+            value=False,
+            help="Translate extracted text before generating audio.",
+        )
+
+        target_lang  = source_lang
+        trans_engine = "auto"
+
+        if translate:
+            langs        = Config.get_all_language_labels()
+            label_list   = list(langs.values())
+            code_list    = list(langs.keys())
+            default_target = "en"
+            default_idx    = code_list.index(default_target) if default_target in code_list else 0
+
+            target_label = st.selectbox(
+                "Translate to",
+                options=label_list,
+                index=default_idx,
+                key="translation_target_lang",
+            )
+            target_lang = code_list[label_list.index(target_label)]
+
+            # Engine status
+            g_ok = Config.is_google_translate_available()
+            l_ok = Config.is_libretranslate_available()
+            st.caption("Engine status:")
+            st.caption(f"{'🟢' if g_ok else '🔴'} Google Translate (free, unofficial API)")
+            st.caption(f"{'🟢' if l_ok else '🔴'} LibreTranslate ({Config.LIBRETRANSLATE_URL})")
+            st.caption(
+                "Rate limits: Google — no hard limit for occasional use. "
+                "LibreTranslate public — ~80 requests/hour × 4,500 chars each "
+                "= ~360,000 chars/hour (~25–40 articles/hour)."
+            )
+
+            trans_engine = st.radio(
+                "Translation engine",
+                options=["auto", "google", "libretranslate"],
+                captions=["Auto (recommended)", "Google only", "LibreTranslate only"],
+                index=0,
+                key="trans_engine_radio",
+            )
+
+            effective_source = st.session_state.get("detected_lang", source_lang) or source_lang
+            if target_lang == effective_source:
+                detected_label = Config.SUPPORTED_LANGUAGES.get(effective_source, {}).get("label", effective_source)
+                target_label_str = Config.SUPPORTED_LANGUAGES.get(target_lang, {}).get("label", target_lang)
+                st.caption(
+                    f"Source ({detected_label}) and target ({target_label_str}) are the same "
+                    f"— no translation will run."
+                )
+            elif effective_source != source_lang:
+                detected_label = Config.SUPPORTED_LANGUAGES.get(effective_source, {}).get("label", effective_source)
+                st.caption(
+                    f"Source auto-detected as {detected_label}. "
+                    f"Translation will run after language detection."
+                )
+
+        return translate, target_lang, trans_engine
+
+    @staticmethod
     def _tts_engine_selector() -> str:
         openai_available = Config.is_openai_available()
-
+        options = ["gtts"]
+        captions = ["🟢 Free (gTTS) — set OPENAI_API_KEY to unlock Premium"]
         if openai_available:
-            options    = ["Free (gTTS)", "Premium (OpenAI)"]
-            engine_map = {"Free (gTTS)": "gtts", "Premium (OpenAI)": "openai"}
-            selected   = st.radio(
-                "TTS engine",
-                options=options,
-                index=0,
-                help=(
-                    "Free: Google Translate TTS — functional, no cost.\n\n"
-                    "Premium: OpenAI tts-1 — natural voice, ~$0.015/1,000 chars."
-                ),
-            )
-            return engine_map[selected]
+            options.append("openai")
+            captions.append("🟢 Premium: OpenAI tts-1 — natural voice, ~$0.015/1,000 chars.")
         else:
-            st.caption("🟢 Free (gTTS) — set OPENAI_API_KEY to unlock Premium")
-            return "gtts"
+            captions[0] = "🟢 Free (gTTS) — set OPENAI_API_KEY to unlock Premium"
 
-    # gTTS TLD map for voice gender by language
-    # Each language has (female_tld, male_tld) — these produce perceptibly
-    # different voices from Google's TTS infrastructure at no cost.
-    GTTS_VOICE_TLDS: dict = {
-        "en":  ("com",   "co.uk"),   # US neutral vs British
-        "es":  ("com",   "com.mx"),  # neutral vs Mexican accent (slightly deeper)
-        "fr":  ("fr",    "ca"),      # France vs Canadian French
-        "de":  ("de",    "at"),      # Germany vs Austrian German
-        "pt":  ("com.br","pt"),      # Brazilian vs European Portuguese
-        "it":  ("it",    "com"),
-        "ja":  ("co.jp", "co.jp"),   # Same for Japanese (limited variation)
-        "zh":  ("com.hk","com"),     # Hong Kong vs mainland
-        "ar":  ("com",   "com"),
-        "ru":  ("ru",    "com"),
-    }
-
-    @staticmethod
-    def _get_gtts_tld(lang_code: str, voice_gender: str) -> str:
-        """Return the gTTS TLD for the given language and voice gender preference."""
-        tlds = UIComponents.GTTS_VOICE_TLDS.get(lang_code, ("com", "com"))
-        return tlds[0] if voice_gender == "Female" else tlds[1]
-
-    @staticmethod
-    def _rate_pitch_sliders() -> tuple[float, float]:
-        rate = st.slider(
-            "Speed",
-            min_value=0.5,
-            max_value=2.0,
-            value=Config.DEFAULT_RATE,
-            step=0.05,
-            help=(
-                "Playback speed. 1.0 = normal. "
-                "Below 0.8 uses gTTS slow mode natively. "
-                "Other values are applied via MP3 frame rate adjustment."
-            ),
+        engine = st.radio(
+            "TTS Engine",
+            options=options,
+            captions=captions,
+            label_visibility="collapsed",
         )
-        pitch = st.slider(
-            "Pitch",
-            min_value=0.5,
-            max_value=2.0,
-            value=Config.DEFAULT_PITCH,
-            step=0.05,
-            help="Pitch adjustment. Currently informational — applied via OpenAI engine only.",
-        )
-        return rate, pitch
+        return engine
 
     @staticmethod
     def _page_range_selector(max_pages: int) -> tuple[int, int]:
         effective_max = max(max_pages, 1)
         col1, col2   = st.columns(2)
 
-        # Use keyed session state for both inputs so Streamlit doesn't
-        # override values between reruns. The keys let us set the values
-        # programmatically (e.g., when a new PDF is loaded with 18 pages,
-        # we push 18 directly into the "To page" widget state).
         END_KEY   = "page_end_input"
         START_KEY = "page_start_input"
 
-        # When a new PDF is loaded (or page count changes), push the
-        # correct default directly into the widget state.
         stored_max = st.session_state.get("last_known_max_pages", 1)
         if effective_max != stored_max:
             st.session_state["last_known_max_pages"] = effective_max
-            # Default "To page" to last page of document
             st.session_state[END_KEY]   = effective_max
             st.session_state[START_KEY] = 1
 
-        # Ensure keys exist with valid values
         if END_KEY not in st.session_state:
             st.session_state[END_KEY] = effective_max
         if START_KEY not in st.session_state:
             st.session_state[START_KEY] = 1
 
-        # Clamp to valid range (in case PDF changed to fewer pages)
         if st.session_state[END_KEY] > effective_max:
             st.session_state[END_KEY] = effective_max
         if st.session_state[START_KEY] > effective_max:
@@ -264,20 +257,14 @@ class UIComponents:
 
         with col1:
             start_page = st.number_input(
-                "From page",
-                min_value=1,
-                max_value=effective_max,
-                step=1,
-                key=START_KEY,
+                "From page", min_value=1, max_value=effective_max,
+                step=1, key=START_KEY,
                 help="First page to process (1-indexed, inclusive).",
             )
         with col2:
             end_page = st.number_input(
-                "To page",
-                min_value=1,
-                max_value=effective_max,
-                step=1,
-                key=END_KEY,
+                "To page", min_value=1, max_value=effective_max,
+                step=1, key=END_KEY,
                 help=(
                     f"Last page to process. PDF has {effective_max} pages. "
                     "Auto-extends if a chapter boundary is detected mid-range."
@@ -288,148 +275,150 @@ class UIComponents:
             selected = int(end_page) - int(start_page) + 1
             st.caption(
                 f"{effective_max} pages total · {selected} selected "
-                + ("· Full document" if selected == effective_max else f"· Pages {int(start_page)}–{int(end_page)}")
+                + ("· Full document" if selected == effective_max
+                   else f"· Pages {int(start_page)}–{int(end_page)}")
             )
         return int(start_page), int(end_page)
 
     @staticmethod
     def _feature_toggles() -> tuple:
-        """
-        Render feature toggle checkboxes.
-        Returns (remove_hf, show_analysis, remove_incomplete_pages, remove_incomplete_chapters)
-        """
-        remove_hf = st.checkbox(
+        remove_hf = st.toggle(
             "Remove headers & footers",
             value=True,
             help=(
-                "Detects and removes running headers, footers, and page numbers "
-                "before generating audio. Uses Y-band repetition detection and "
-                "noise pattern matching. Strongly recommended."
+                "Detect and strip repeating header/footer text "
+                "(running titles, page numbers, publisher info)."
             ),
         )
-        show_analysis = st.checkbox(
+        show_analysis = st.toggle(
             "Show document analysis",
-            value=False,
-            help=(
-                "After processing, display a full Document Intelligence panel: "
-                "readability scores, vocabulary richness, topic density, "
-                "content type detection, chapter complexity ranking, "
-                "sentiment analysis, keyword frequency, and a summary."
-            ),
-        )
-
-        st.markdown("**Content completeness**")
-        st.caption(
-            "These options verify and enforce that only fully captured "
-            "pages and chapters are included in the audio output. "
-            "Verification uses word fingerprinting: the last few words "
-            "of each page are checked against the assembled text."
-        )
-
-        remove_incomplete_pages = st.checkbox(
-            "Remove incomplete pages",
             value=True,
-            help=(
-                "For each chapter, the last page is verified by checking "
-                "whether its final words appear in the assembled chapter text. "
-                "If the fingerprint is not found, that page was cut off and "
-                "is removed from the audio. "
-                "Recommended ON — prevents audio cutting off mid-sentence."
-            ),
-        )
-        remove_incomplete_chapters = st.checkbox(
-            "Remove incomplete chapters",
-            value=False,
-            help=(
-                "If a chapter's last page fails fingerprint verification, "
-                "or the chapter text ends mid-word, the entire chapter is "
-                "excluded from the audio output. "
-                "More aggressive than page removal — off by default. "
-                "Enable if you want strictly complete chapters only."
-            ),
+            help="Display NLP KPIs, readability scores, keyword density, and more.",
         )
 
-        return remove_hf, show_analysis, remove_incomplete_pages, remove_incomplete_chapters
+        with st.expander("Content completeness"):
+            st.caption(
+                "These options verify and enforce that only fully captured pages "
+                "and chapters are included in the audio output. Verification uses "
+                "word fingerprinting: the last few words of each page are checked "
+                "against the assembled text."
+            )
+            remove_inc_pages = st.toggle(
+                "Remove incomplete pages",
+                value=False,
+                help=(
+                    "Remove pages whose last words are not found in the assembled "
+                    "text — typically cut-off pages at PDF boundaries."
+                ),
+            )
+            remove_inc_chapters = st.toggle(
+                "Remove incomplete chapters",
+                value=False,
+                help=(
+                    "Remove chapters whose last page failed fingerprint verification. "
+                    "More aggressive than page removal."
+                ),
+            )
+
+        return remove_hf, show_analysis, remove_inc_pages, remove_inc_chapters
+
+    # ================================================================== #
+    # SECTION 2 — FILE INPUT                                              #
+    # ================================================================== #
 
     @staticmethod
-    def _translation_settings(source_lang: str) -> tuple:
-        """
-        Translation controls. Returns (translate, target_lang, engine).
-        """
-        translate = st.toggle(
-            "Translate output",
-            value=False,
-            help=(
-                "Translate extracted text to a different language before "
-                "generating audio. Translation runs after header/footer removal "
-                "and chapter splitting. Document analysis always runs on the "
-                "original source language."
-            ),
-        )
-
-        if not translate:
-            return False, source_lang, "auto"
-
-        trans_langs  = Config.TRANSLATION_SUPPORTED_LANGUAGES
-        lang_labels  = list(trans_langs.values())
-        lang_codes   = list(trans_langs.keys())
-
-        default_target = "en" if source_lang != "en" else "es"
-        default_idx    = lang_codes.index(default_target) if default_target in lang_codes else 0
-
-        selected_label = st.selectbox(
-            "Translate to",
-            options=lang_labels,
-            index=default_idx,
-        )
-        target_lang = lang_codes[lang_labels.index(selected_label)]
-
-        # Check against auto-detected language too (auto-detect overrides sidebar)
-        effective_source = st.session_state.get("detected_lang", source_lang) or source_lang
-        if target_lang == effective_source:
-            detected_label = Config.SUPPORTED_LANGUAGES.get(effective_source, {}).get("label", effective_source)
-            target_label   = Config.SUPPORTED_LANGUAGES.get(target_lang, {}).get("label", target_lang)
-            st.caption(
-                f"Source ({detected_label}) and target ({target_label}) are the same "
-                f"— no translation will run."
-            )
-        elif effective_source != source_lang:
-            detected_label = Config.SUPPORTED_LANGUAGES.get(effective_source, {}).get("label", effective_source)
-            st.caption(
-                f"Source auto-detected as {detected_label}. "
-                f"Translation will run after language detection."
-            )
-
-        st.markdown("**Engine status:**")
-        g_icon = "🟢" if Config.is_google_translate_available() else "🔴"
-        l_icon = "🟢" if Config.is_libretranslate_available()   else "🔴"
-        st.caption(f"{g_icon} Google Translate (free, unofficial API)")
-        st.caption(f"{l_icon} LibreTranslate ({Config.LIBRETRANSLATE_URL})")
-        st.caption("Rate limits: Google — no hard limit for occasional use. LibreTranslate public — ~80 requests/hour × 4,500 chars each = ~360,000 chars/hour (~25–40 articles/hour).")
-
-        engine_options = ["Auto (recommended)"]
-        if Config.is_google_translate_available():
-            engine_options.append("Google only")
-        if Config.is_libretranslate_available():
-            engine_options.append("LibreTranslate only")
-
-        selected_engine = st.radio(
-            "Engine preference",
-            options=engine_options,
-            index=0,
+    def file_uploader_widget():
+        return st.file_uploader(
+            "Upload PDF",
+            type=["pdf"],
             label_visibility="collapsed",
+            help="Upload a PDF file to convert to audio.",
         )
 
-        engine_map    = {
-            "Auto (recommended)": "auto",
-            "Google only":        "google",
-            "LibreTranslate only": "libretranslate",
-        }
-        return True, target_lang, engine_map.get(selected_engine, "auto")
+    @staticmethod
+    def local_file_selector(folder_path: str = ".") -> str | None:
+        import os, glob
+        pdf_files = sorted(glob.glob(os.path.join(folder_path, "*.pdf")))
+        if not pdf_files:
+            st.info("No PDF files found in the current directory.")
+            return None
+        options   = ["— select —"] + [os.path.basename(f) for f in pdf_files]
+        selected  = st.selectbox("Local PDF file", options, key="local_file_select")
+        if selected == "— select —":
+            return None
+        return os.path.join(folder_path, selected)
 
     # ================================================================== #
-    # SECTION 3 — STATUS BANNERS                                          #
+    # SECTION 3 — PRE-PROCESSING SUMMARY                                  #
     # ================================================================== #
+
+    @staticmethod
+    def render_preprocessing_summary(
+        size_mb:          float,
+        page_count:       int,
+        selected_pages:   int,
+        chapter_list:     list[dict],
+        est_audio_min:    float,
+        est_time_range:   str,
+        mode_hint:        str,
+        warnings:         list[dict],
+        start_page:       int,
+        end_page:         int,
+    ) -> None:
+        with st.container(border=True):
+            st.markdown("**📋 What you're about to process**")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("Total pages",    page_count)
+                st.metric("Selected pages", selected_pages)
+            with c2:
+                ch_count = len(chapter_list)
+                st.metric("Chapters detected", ch_count if ch_count else "—")
+                st.metric("Est. audio output", f"{est_audio_min:.0f} min")
+
+            st.caption(
+                f"Estimated processing time: {est_time_range} "
+                "(depends on TTS engine and network). "
+                "Keep this tab open — Streamlit does not process in the background."
+            )
+
+            if chapter_list:
+                with st.expander(f"Chapters detected in pre-scan ({len(chapter_list)})"):
+                    for ch in chapter_list:
+                        p1, p2 = ch.get("start", 1), ch.get("end", page_count)
+                        pg_str = f"pp. {p1}–{p2}" if p1 != p2 else f"p. {p1}"
+                        st.markdown(f"✅ **{ch['title']}** — {pg_str}")
+
+            for w in warnings:
+                if w.get("extended"):
+                    st.warning(
+                        f"⚡ Chapter '{w['chapter']}' extends to p.{w['chapter_end']}. "
+                        f"Page range auto-extended from {w['cut_at']} → {w['chapter_end']}."
+                    )
+                else:
+                    st.info(
+                        f"ℹ️ Chapter '{w['chapter']}' appears to continue beyond "
+                        f"selected end page {w['cut_at']}."
+                    )
+
+    # ================================================================== #
+    # SECTION 4 — STATUS BANNERS                                          #
+    # ================================================================== #
+
+    @staticmethod
+    def render_extraction_mode_banner(mode: str, page_count: int) -> None:
+        if mode == "text":
+            st.success(
+                f"✅ Text mode — native text extraction ({page_count} pages). "
+                "Fast and accurate."
+            )
+        elif mode == "ocr":
+            st.info(
+                f"🔍 OCR mode — image-based extraction ({page_count} pages). "
+                "Slower; accuracy depends on scan quality."
+            )
+        else:
+            st.info(f"ℹ️ Extraction mode: {mode} ({page_count} pages)")
 
     @staticmethod
     def render_detected_language_banner(detected_lang: str, selected_lang: str) -> None:
@@ -457,7 +446,6 @@ class UIComponents:
         engine_name  = engine_names.get(engine_used, engine_used)
 
         if "original" in engine_used:
-            # Translation failed silently or was skipped
             st.warning(
                 f"⚠️ Translation requested ({source_label} → {target_label}) but "
                 f"both engines failed or returned unchanged text. "
@@ -471,303 +459,41 @@ class UIComponents:
             )
 
     @staticmethod
-    def render_page_range_warning(
-        original_end:    int,
-        extended_end:    int,
-        chapters_cut:    list[dict],
-    ) -> None:
-        """
-        Show a banner explaining that the page range was auto-extended
-        because it would have cut through one or more chapters.
-
-        Args:
-          original_end:  the page the user originally requested
-          extended_end:  the page we extended to
-          chapters_cut:  list of warning dicts from get_chapter_aware_page_range
-        """
-        if not chapters_cut:
-            return
-
-        chapter_names = ", ".join(
-            f"'{w['chapter']}' (ends p.{w['chapter_end']})"
-            for w in chapters_cut
-        )
-
-        st.warning(
-            f"📖 **Page range extended: p.{original_end} → p.{extended_end}**  \n"
-            f"Your selection would have cut through {chapter_names}. "
-            f"The range was automatically extended to include complete chapters. "
-            f"You can disable this in Config (AUTO_EXTEND_PAGE_RANGE=False) "
-            f"if you prefer to process exact page ranges and let the "
-            f"completeness checker remove incomplete content instead."
-        )
-
-    @staticmethod
-    def render_completeness_report(
+    def render_completeness_banner(
         incomplete_pages:    set,
         incomplete_chapters: set,
-        total_pages:         int,
-        total_chapters:      int,
     ) -> None:
-        """
-        Show a summary of what the completeness checker found and removed.
-        Displayed after processing so the user knows exactly what they got.
-        """
         if not incomplete_pages and not incomplete_chapters:
             st.success(
-                "✅ **Completeness verified** — all pages and chapters "
-                "passed fingerprint verification. Audio covers the full "
-                "requested range."
+                "✅ Completeness verified — all pages and chapters passed "
+                "fingerprint verification. Audio covers the full requested range."
             )
             return
 
-        lines = ["**⚠️ Completeness report:**"]
-
+        items = []
         if incomplete_pages:
-            page_list = ", ".join(str(p + 1) for p in sorted(incomplete_pages))
-            lines.append(
-                f"- **{len(incomplete_pages)} page(s) removed** "
-                f"(fingerprint not found in assembled text): pages {page_list}"
+            pg_nums = ", ".join(str(p + 1) for p in sorted(incomplete_pages))
+            items.append(
+                f"{len(incomplete_pages)} page(s) removed "
+                f"(fingerprint not found in assembled text): pages {pg_nums}"
             )
-
         if incomplete_chapters:
-            ch_list = ", ".join(f"'{c}'" for c in sorted(incomplete_chapters))
-            lines.append(
-                f"- **{len(incomplete_chapters)} chapter(s) removed** "
-                f"(last page failed verification or text ends mid-word): {ch_list}"
+            items.append(
+                f"{len(incomplete_chapters)} chapter(s) removed "
+                f"(incomplete): {', '.join(sorted(incomplete_chapters))}"
             )
 
-        lines.append(
-            f"Audio covers {total_chapters - len(incomplete_chapters)} of "
-            f"{total_chapters} detected chapters."
-        )
+        total_ch   = st.session_state.get("total_chapters_before_removal", "?")
+        remain_ch  = st.session_state.get("total_chapters_after_removal", "?")
 
-        st.warning("\n".join(lines))
-
-    @staticmethod
-    def render_pre_processing_summary(
-        total_pages:    int,
-        selected_pages: int,
-        chapters_found: list[dict],
-        est_minutes:    float,
-        est_audio_hrs:  float,
-        warnings:       list[dict],
-        extended_end:   int,
-        original_end:   int,
-    ) -> None:
-        """
-        Show the user a complete picture of what they're about to process
-        BEFORE they click Convert. Displayed immediately after a PDF is loaded.
-
-        Covers:
-          - Total pages vs selected pages
-          - Chapters detected in pre-scan
-          - Estimated processing time and audio output length
-          - Any chapter-boundary warnings with auto-extend notice
-        """
-        st.markdown("### 📋 What you're about to process")
-
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("Total pages", total_pages)
-        with c2:
-            st.metric("Selected pages", selected_pages)
-        with c3:
-            st.metric("Chapters detected", len(chapters_found) if chapters_found else "—")
-        with c4:
-            st.metric("Est. audio output", f"{est_audio_hrs:.1f} hrs" if est_audio_hrs >= 1 else f"{int(est_audio_hrs * 60)} min")
-
-        st.caption(
-            f"Estimated processing time: {est_minutes:.0f}–{est_minutes * 1.5:.0f} min "
-            f"(depends on TTS engine and network). "
-            f"Keep this tab open — Streamlit does not process in the background."
-        )
-
-        # Chapter list from pre-scan
-        if chapters_found:
-            with st.expander(f"Chapters detected in pre-scan ({len(chapters_found)})", expanded=False):
-                for ch in chapters_found:
-                    in_range = ch["start"] <= (extended_end or original_end)
-                    icon     = "✅" if in_range else "⬜"
-                    st.caption(
-                        f"{icon} **{ch['title']}** — pp. {ch['start']}–{ch['end']}"
-                    )
-
-        # Warnings about chapter cuts
-        if warnings:
-            for w in warnings:
-                if w.get("extended"):
-                    st.info(
-                        f"📖 Chapter boundary detected: **'{w['chapter']}'** "
-                        f"starts within your selection but ends on p.{w['chapter_end']}. "
-                        f"Page range auto-extended from p.{original_end} to p.{extended_end} "
-                        f"so this chapter is fully included."
-                    )
-                else:
-                    st.warning(
-                        f"⚠️ Chapter **'{w['chapter']}'** ends on p.{w['chapter_end']} "
-                        f"but your selection ends on p.{original_end}. "
-                        f"This chapter will be cut. Enable AUTO_EXTEND_PAGE_RANGE "
-                        f"in config to avoid this automatically."
-                    )
+        body = "⚠️ Completeness report:\n\n"
+        for item in items:
+            body += f"* {item}\n"
+        body += f"Audio covers {remain_ch} of {total_ch} detected chapters."
+        st.warning(body)
 
     # ================================================================== #
-    # SECTION 4 — DOCUMENT DISPLAY                                        #
-    # ================================================================== #
-
-    @staticmethod
-    def render_metadata(metadata: dict) -> None:
-        if not metadata:
-            return
-        fields = []
-        if metadata.get("title"):
-            fields.append(f"**Title:** {metadata['title']}")
-        if metadata.get("author"):
-            fields.append(f"**Author:** {metadata['author']}")
-        if metadata.get("subject"):
-            fields.append(f"**Subject:** {metadata['subject']}")
-        if fields:
-            st.info("  \n".join(fields))
-
-    @staticmethod
-    def render_processing_status(mode_used: str, page_count: int) -> None:
-        if mode_used == "text":
-            st.success(
-                f"✅ **Text mode** — native text extraction "
-                f"({page_count} pages). Fast and accurate."
-            )
-        else:
-            st.warning(
-                f"🔍 **OCR mode** — scanned PDF ({page_count} pages). "
-                f"Quality depends on scan resolution."
-            )
-
-    @staticmethod
-    def render_table_of_contents(
-        chapters:        OrderedDict,
-        current_chapter: str,
-        page_ranges:     dict = None,
-        chapter_status:  dict = None,
-    ) -> None:
-        """
-        Clickable TOC with page ranges, word counts, and live status icons.
-        """
-        st.subheader("Chapters")
-        if not chapters:
-            st.caption("No chapters detected.")
-            return
-
-        status_icons = {
-            "done":       "✅",
-            "processing": "⏳",
-            "failed":     "❌",
-            "queued":     "⬜",
-            "removed":    "🗑️",
-        }
-
-        for i, title in enumerate(chapters.keys()):
-            display_title = title if len(title) <= 40 else title[:37] + "…"
-            page_label    = ""
-            if page_ranges and title in page_ranges:
-                p1, p2 = page_ranges[title]
-                if p1 > 0:
-                    page_label = f"pp. {p1}–{p2}" if p1 != p2 else f"p. {p1}"
-
-            status      = chapter_status.get(title, "") if chapter_status else ""
-            icon        = status_icons.get(status, "")
-            word_count  = len(chapters[title].split()) if chapters[title] else 0
-            sub_parts   = []
-            if page_label:
-                sub_parts.append(page_label)
-            if word_count:
-                sub_parts.append(f"{word_count:,} words")
-            sub         = " · ".join(sub_parts)
-            is_disabled = status in ("processing", "queued", "failed", "removed")
-
-            if title == current_chapter:
-                st.markdown(f"**{icon} ▶ {display_title}**")
-                if sub:
-                    st.caption(sub)
-            else:
-                btn_label = f"{icon} {display_title}".strip() if icon else display_title
-                if st.button(
-                    btn_label,
-                    key=f"toc_btn_{i}",
-                    use_container_width=True,
-                    help=sub or f"{word_count:,} words",
-                    disabled=is_disabled,
-                ):
-                    st.session_state.current_chapter = title
-                    st.rerun()
-
-    @staticmethod
-    def render_pdf_preview(pdf_bytes: bytes) -> None:
-        with st.expander("📄 Preview PDF", expanded=False):
-            try:
-                b64_pdf  = base64.b64encode(pdf_bytes).decode("utf-8")
-                pdf_html = (
-                    f'<iframe src="data:application/pdf;base64,{b64_pdf}" '
-                    f'width="100%" height="500px" type="application/pdf"></iframe>'
-                )
-                st.markdown(pdf_html, unsafe_allow_html=True)
-            except Exception as e:
-                st.warning(f"PDF preview unavailable: {e}")
-
-    # ================================================================== #
-    # SECTION 5 — AUDIO PLAYER                                           #
-    # ================================================================== #
-
-    @staticmethod
-    def render_audio_player(
-        audio_bytes:    bytes,
-        chapter_title:  str,
-        chapter_index:  int,
-        total_chapters: int,
-    ) -> None:
-        if not audio_bytes:
-            st.warning("No audio available for this chapter.")
-            return
-
-        st.markdown(
-            f"**{chapter_title}**  "
-            f"<small style='color:gray'>Chapter {chapter_index + 1} of {total_chapters}</small>",
-            unsafe_allow_html=True,
-        )
-        st.audio(audio_bytes, format="audio/mp3")
-
-    @staticmethod
-    def render_chapter_navigation(chapters: OrderedDict, current_chapter: str) -> None:
-        chapter_list = list(chapters.keys())
-        current_idx  = chapter_list.index(current_chapter) if current_chapter in chapter_list else 0
-
-        col1, col2, col3 = st.columns([1, 2, 1])
-
-        with col1:
-            if current_idx > 0:
-                if st.button("⬅️ Previous", use_container_width=True):
-                    st.session_state.current_chapter = chapter_list[current_idx - 1]
-                    st.rerun()
-
-        with col2:
-            st.caption(f"Chapter {current_idx + 1} of {len(chapter_list)}")
-
-        with col3:
-            if current_idx < len(chapter_list) - 1:
-                if st.button("Next ➡️", use_container_width=True):
-                    st.session_state.current_chapter = chapter_list[current_idx + 1]
-                    st.rerun()
-
-    @staticmethod
-    def render_progress(current_chapter: str, chapters: OrderedDict) -> None:
-        chapter_list = list(chapters.keys())
-        if not chapter_list:
-            return
-        idx = chapter_list.index(current_chapter) if current_chapter in chapter_list else 0
-        pct = (idx + 1) / len(chapter_list)
-        st.progress(pct, text=f"Progress: {idx + 1}/{len(chapter_list)} chapters")
-
-    # ================================================================== #
-    # SECTION 5B — LIVE CHAPTER QUEUE                                    #
+    # SECTION 5 — CHAPTER QUEUE                                           #
     # ================================================================== #
 
     @staticmethod
@@ -779,7 +505,7 @@ class UIComponents:
     ) -> None:
         """
         Live queue showing per-chapter status during and after processing.
-        Each completed chapter gets an individual download button immediately.
+        Completed chapters get individual download buttons immediately.
         """
         status_icons = {
             "done":       "✅",
@@ -805,13 +531,15 @@ class UIComponents:
 
         st.progress(pct / 100.0)
 
-        for title, text in chapters.items():
-            status      = chapter_status.get(title, "queued")
-            icon        = status_icons.get(status, "⬜")
-            display     = title if len(title) <= 35 else title[:32] + "…"
-            word_count  = len(text.split()) if text else 0
+        pdf_title = st.session_state.get("pdf_title", "")
 
-            page_label  = ""
+        for title, text in chapters.items():
+            status     = chapter_status.get(title, "queued")
+            icon       = status_icons.get(status, "⬜")
+            display    = title if len(title) <= 35 else title[:32] + "…"
+            word_count = len(text.split()) if text else 0
+
+            page_label = ""
             if page_ranges and title in page_ranges:
                 p1, p2 = page_ranges[title]
                 if p1 > 0:
@@ -826,16 +554,13 @@ class UIComponents:
             with col2:
                 if status == "done" and title in audio_data:
                     audio_bytes = audio_data[title]
-                    pdf_title   = st.session_state.get("pdf_title", "")
                     q_fname     = UIComponents._make_filename(pdf_title, title) + ".mp3"
-                    # Estimate duration from file size (MP3 at ~128kbps)
                     dur_secs    = len(audio_bytes) / 16_000.0
                     mins        = int(dur_secs) // 60
                     secs        = int(dur_secs) % 60
-                    # Use a unique key that includes both title hash AND a
-                    # session-level render counter so the queue can be rendered
-                    # multiple times without Streamlit's duplicate-key error.
-                    render_id = st.session_state.get("_queue_render_id", 0)
+                    # Unique key: monotonic render_id prevents duplicate key error
+                    # when queue is rendered multiple times (during + after pipeline)
+                    render_id   = st.session_state.get("_queue_render_id", 0)
                     st.session_state["_queue_render_id"] = render_id + 1
                     st.download_button(
                         label=f"⬇️ {mins}:{secs:02d}",
@@ -855,15 +580,118 @@ class UIComponents:
                     st.caption("⬜")
 
     # ================================================================== #
+    # SECTION 5B — AUDIO PLAYER + POST-GENERATION ADJUSTMENT              #
+    # ================================================================== #
+
+    @staticmethod
+    def render_audio_player(
+        audio_data:     dict,
+        current_chapter: str,
+        chapters:       OrderedDict,
+        page_ranges:    dict = None,
+    ) -> None:
+        """Audio player for the current chapter."""
+        chapter_audio = audio_data.get(current_chapter, b"")
+        if not chapter_audio:
+            st.info("Audio not yet generated for this chapter.")
+            return
+
+        page_label = ""
+        if page_ranges and current_chapter in page_ranges:
+            p1, p2 = page_ranges[current_chapter]
+            if p1 > 0:
+                page_label = f" · pp. {p1}–{p2}" if p1 != p2 else f" · p. {p1}"
+
+        word_count = len((chapters.get(current_chapter) or "").split())
+        st.audio(chapter_audio, format="audio/mp3")
+        st.caption(
+            f"**{current_chapter}**{page_label} · {word_count:,} words"
+        )
+
+    @staticmethod
+    def render_audio_adjustment_panel(
+        audio_data: dict,
+        chapters:   OrderedDict,
+        pdf_title:  str = "",
+    ) -> None:
+        """
+        Post-generation speed/pitch panel shown between the player and downloads.
+
+        Design rationale:
+        - Speed/pitch are listener preferences, not content properties.
+        - The user can't know their ideal rate until they've heard the audio.
+        - Post-gen adjustment avoids re-running TTS (expensive) for what is
+          essentially a playback preference.
+        - Sidebar is kept clean for content-relevant settings only.
+
+        Speed: changes playback rate via MP3 sample-rate header rewrite (pure Python).
+        Pitch: uses pydub frame-rate trick if pydub is available; else skipped.
+        Both are applied to the combined audio at download time, not in the player.
+        """
+        st.markdown("**🎛️ Audio Adjustments**")
+        st.caption(
+            "Tweak speed and pitch after generation — no re-processing needed. "
+            "Downloads below reflect your current settings."
+        )
+
+        adj_col1, adj_col2 = st.columns(2)
+        with adj_col1:
+            adj_speed = st.slider(
+                "Speed",
+                min_value=0.5, max_value=2.5,
+                value=st.session_state.get("adj_speed", 1.0),
+                step=0.05, format="%.2f×",
+                key="adj_speed_slider",
+                help="1.0 = original speed. Applied at download time.",
+            )
+        with adj_col2:
+            adj_pitch = st.slider(
+                "Pitch",
+                min_value=0.5, max_value=2.0,
+                value=st.session_state.get("adj_pitch", 1.0),
+                step=0.05, format="%.2f×",
+                key="adj_pitch_slider",
+                help="1.0 = original pitch. Independent of speed.",
+            )
+
+        st.session_state["adj_speed"] = adj_speed
+        st.session_state["adj_pitch"] = adj_pitch
+
+        speed_changed = abs(adj_speed - 1.0) > 0.02
+        pitch_changed = abs(adj_pitch - 1.0) > 0.02
+        if speed_changed or pitch_changed:
+            tags = []
+            if speed_changed:
+                tags.append(f"{adj_speed:.2f}× speed")
+            if pitch_changed:
+                tags.append(f"{adj_pitch:.2f}× pitch")
+            st.caption(f"✏️ Adjustments active: {', '.join(tags)}")
+
+        st.session_state["_audio_adj_speed"] = adj_speed
+        st.session_state["_audio_adj_pitch"] = adj_pitch
+
+    @staticmethod
+    def _apply_audio_adjustments(audio_bytes: bytes) -> bytes:
+        """Apply current speed/pitch settings to audio bytes. Returns adjusted bytes."""
+        from audio_generator import AudioGenerator
+        speed = st.session_state.get("_audio_adj_speed", 1.0)
+        pitch = st.session_state.get("_audio_adj_pitch", 1.0)
+        result = audio_bytes
+        if abs(speed - 1.0) > 0.02:
+            result = AudioGenerator.apply_speed(result, speed)
+        if abs(pitch - 1.0) > 0.02:
+            result = AudioGenerator.apply_pitch(result, pitch)
+        return result
+
+    # ================================================================== #
     # SECTION 5C — DOWNLOAD BUTTONS                                       #
     # ================================================================== #
 
     @staticmethod
-    @staticmethod
     def _make_filename(pdf_title: str, chapter_title: str = "", suffix: str = "") -> str:
-        """Build a clean, relevant filename from PDF title + chapter."""
-        def slug(s: str, max_len: int = 30) -> str:
-            s = re.sub(r"[^a-zA-Z0-9À-ÿ _-]", "", s).strip()
+        """Build a clean, descriptive filename from PDF title + chapter."""
+        def slug(s: str, max_len: int = 35) -> str:
+            s = re.sub(r"[^a-zA-Z0-9 _-]", "", s).strip()
             s = re.sub(r" +", "_", s)
             return s[:max_len].rstrip("_")
 
@@ -878,91 +706,27 @@ class UIComponents:
         return name or "ReadMyPDF"
 
     @staticmethod
-    def render_audio_adjustment_panel(audio_data: dict, chapters: OrderedDict, pdf_title: str = "") -> None:
-        """
-        Post-generation speed/pitch adjustment panel shown above downloads.
-        Applies FFmpeg-style speed change to already-generated audio without
-        re-running TTS. This lets users tweak pacing instantly.
-        Uses mutagen for duration reading and audioop/array for resampling.
-        """
-        with st.expander("🎛️ Adjust Audio (Speed / Pitch)", expanded=False):
-            st.caption(
-                "Modify the generated audio without re-processing. "
-                "Adjusted files are ready to download immediately."
-            )
-            adj_col1, adj_col2 = st.columns(2)
-            with adj_col1:
-                adj_speed = st.slider(
-                    "Speed",
-                    min_value=0.5, max_value=2.5, value=1.0, step=0.05,
-                    format="%.2f×",
-                    help="1.0 = original speed. Applied via audio resampling.",
-                    key="post_speed_slider",
-                )
-            with adj_col2:
-                adj_pitch = st.slider(
-                    "Pitch",
-                    min_value=0.5, max_value=2.0, value=1.0, step=0.05,
-                    format="%.2f×",
-                    help="1.0 = original pitch. Independent of speed.",
-                    key="post_pitch_slider",
-                )
-
-            if st.button("✨ Apply & Download Adjusted", use_container_width=True, key="apply_adj"):
-                if not audio_data:
-                    st.warning("No audio to adjust yet.")
-                    return
-                with st.spinner("Applying adjustments…"):
-                    # Combine all chapters
-                    silence = bytes([0xFF, 0xFB, 0x90, 0x00, *([0x00] * 40)]) * 32
-                    buf = io.BytesIO()
-                    for i, title in enumerate(chapters.keys()):
-                        ch = audio_data.get(title, b"")
-                        if ch:
-                            buf.write(ch)
-                            if i < len(chapters) - 1:
-                                buf.write(silence)
-                    combined = buf.getvalue()
-
-                    if combined:
-                        from audio_generator import AudioGenerator
-                        adjusted = combined
-                        if abs(adj_speed - 1.0) > 0.02:
-                            adjusted = AudioGenerator.apply_speed(adjusted, adj_speed)
-                        if abs(adj_pitch - 1.0) > 0.02:
-                            adjusted = AudioGenerator.apply_pitch(adjusted, adj_pitch)
-
-                        adj_fname = UIComponents._make_filename(pdf_title, "", f"_x{adj_speed:.1f}.mp3")
-                        st.download_button(
-                            label=f"⬇️ Download Adjusted ({adj_speed:.1f}× speed, {adj_pitch:.1f}× pitch)",
-                            data=adjusted,
-                            file_name=adj_fname,
-                            mime="audio/mpeg",
-                            use_container_width=True,
-                            key="dl_adjusted",
-                        )
-
-    @staticmethod
     def render_download_buttons(
         audio_data:      dict,
         current_chapter: str,
         chapters:        OrderedDict,
         pdf_title:       str = "",
     ) -> None:
-        """
-        Chapter download + Full Book download.
-        Full book label shows partial count when not all chapters are ready.
-        """
+        """Chapter + Full Book download with adjustments applied."""
         st.markdown("**⬇️ Downloads**")
+        st.caption(
+            "Downloads apply current Speed/Pitch adjustments from the panel above."
+        )
         col1, col2 = st.columns(2)
 
         with col1:
             chapter_audio = audio_data.get(current_chapter, b"")
             if chapter_audio:
+                adjusted = UIComponents._apply_audio_adjustments(chapter_audio)
                 fname = UIComponents._make_filename(pdf_title, current_chapter) + ".mp3"
                 st.download_button(
                     label="📥 This Chapter",
-                    data=chapter_audio,
+                    data=adjusted,
                     file_name=fname,
                     mime="audio/mpeg",
                     use_container_width=True,
@@ -973,12 +737,8 @@ class UIComponents:
 
         with col2:
             if audio_data:
-                silence_gap = bytes([
-                    0xFF, 0xFB, 0x90, 0x00,
-                    *([0x00] * 40),
-                ]) * 32
-
-                buf           = io.BytesIO()
+                silence_gap = bytes([0xFF, 0xFB, 0x90, 0x00, *([0x00] * 40)]) * 32
+                buf         = io.BytesIO()
                 chapter_order = list(chapters.keys())
 
                 for i, title in enumerate(chapter_order):
@@ -988,12 +748,12 @@ class UIComponents:
                         if i < len(chapter_order) - 1:
                             buf.write(silence_gap)
 
-                full_book_bytes = buf.getvalue()
-
-                if full_book_bytes:
-                    available = len(audio_data)
-                    total     = len(chapters)
-                    label     = (
+                combined = buf.getvalue()
+                if combined:
+                    adjusted_full = UIComponents._apply_audio_adjustments(combined)
+                    available     = len(audio_data)
+                    total         = len(chapters)
+                    label         = (
                         f"📚 Full Book ({available} of {total} chapters)"
                         if available < total
                         else f"📚 Full Book ({available} chapters)"
@@ -1001,7 +761,7 @@ class UIComponents:
                     full_fname = UIComponents._make_filename(pdf_title, "", "_full.mp3")
                     st.download_button(
                         label=label,
-                        data=full_book_bytes,
+                        data=adjusted_full,
                         file_name=full_fname,
                         mime="audio/mpeg",
                         use_container_width=True,
@@ -1025,33 +785,39 @@ class UIComponents:
                 st.rerun()
         else:
             if st.button("🔖 Add bookmark", use_container_width=True):
-                if "bookmarks" not in st.session_state:
-                    st.session_state.bookmarks = []
                 st.session_state.bookmarks.append(current_chapter)
                 st.rerun()
 
     @staticmethod
-    def render_bookmarks_list(chapters: OrderedDict) -> None:
-        bookmarks = st.session_state.get("bookmarks", [])
+    def render_bookmarks_panel(
+        audio_data:    dict,
+        bookmarks:     list,
+        chapters:      OrderedDict,
+        pdf_title:     str = "",
+    ) -> None:
         if not bookmarks:
             return
-
         st.markdown("**🔖 Bookmarks**")
-        stale = []
-        for i, bm in enumerate(bookmarks):
-            if bm not in chapters:
-                stale.append(bm)
-                continue
-            display = bm if len(bm) <= 30 else bm[:27] + "…"
-            if st.button(display, key=f"bm_btn_{i}", use_container_width=True):
-                st.session_state.current_chapter = bm
-                st.rerun()
-
-        if stale:
-            st.session_state.bookmarks = [b for b in bookmarks if b not in stale]
+        for bm in bookmarks:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(f"• {bm}")
+            with col2:
+                if bm in audio_data:
+                    bm_audio  = UIComponents._apply_audio_adjustments(audio_data[bm])
+                    bm_fname  = UIComponents._make_filename(pdf_title, bm) + "_bookmark.mp3"
+                    render_id = st.session_state.get("_queue_render_id", 0)
+                    st.session_state["_queue_render_id"] = render_id + 1
+                    st.download_button(
+                        label="⬇️",
+                        data=bm_audio,
+                        file_name=bm_fname,
+                        mime="audio/mpeg",
+                        key=f"dl_bm_{render_id}_{hash(bm) % 99999}",
+                    )
 
     # ================================================================== #
-    # SECTION 7 — ANALYSIS PANEL                                          #
+    # SECTION 7 — DOCUMENT ANALYSIS                                       #
     # ================================================================== #
 
     @staticmethod
@@ -1070,131 +836,128 @@ class UIComponents:
         lexical_diversity:    dict  = None,
         sentence_complexity:  dict  = None,
     ) -> None:
+        st.markdown("---")
         st.subheader("📊 Document Intelligence")
 
-        # Row 1: core KPIs
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
+        # Row 0: Quick KPI metrics
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
             st.metric("Words", f"{word_count:,}")
-        with c2:
+        with m2:
             st.metric("Est. Listening Time", reading_time)
         if text_stats:
-            with c3:
+            with m3:
                 st.metric("Unique Words", f"{text_stats.get('unique_words', 0):,}")
-            with c4:
-                vr = text_stats.get("vocabulary_richness", 0)
-                st.metric("Vocabulary Richness", f"{vr}%",
-                          help="Unique words / total words × 100. Higher = more diverse.")
+            with m4:
+                st.metric(
+                    "Vocabulary Richness",
+                    f"{text_stats.get('vocabulary_richness', 0):.1f}%",
+                )
 
         st.divider()
 
-        # Row 2: readability + content type
-        col_read, col_type = st.columns([3, 2])
-
-        with col_read:
+        # Row 1: Readability
+        if readability:
             st.markdown("**📖 Readability**")
-            if readability:
-                fe = readability.get("flesch_ease", 0)
-                fk = readability.get("flesch_kincaid", 0)
-                gl = readability.get("grade_label", "Unknown")
-                el = readability.get("ease_label", "Unknown")
-                r1, r2, r3 = st.columns(3)
-                with r1:
-                    st.metric("Flesch Ease", f"{fe}/100",
-                              help="0=hardest, 100=easiest. 60–70 is standard adult reading.")
-                with r2:
-                    st.metric("Grade Level", f"{fk}")
-                with r3:
-                    st.metric("Reading Level", gl)
-                bar_color = "🟢" if fe >= 70 else ("🟡" if fe >= 50 else "🔴")
-                st.caption(f"{bar_color} {el} — {fe}/100 ease score")
-                if text_stats:
-                    s1, s2, s3 = st.columns(3)
-                    with s1:
-                        st.metric("Avg Sentence", f"{text_stats.get('avg_sentence_length', 0)} words",
-                                  help="Sentences >25 words are harder to follow in audio.")
-                    with s2:
-                        st.metric("Avg Word Length", f"{text_stats.get('avg_word_length', 0)} chars")
-                    with s3:
-                        st.metric("Sentences", f"{text_stats.get('total_sentences', 0):,}")
+            r1, r2, r3 = st.columns(3)
+            with r1:
+                st.metric(
+                    "Flesch Ease",
+                    f"{readability['flesch_ease']}/100",
+                    help="0=Very Hard, 100=Very Easy",
+                )
+            with r2:
+                st.metric("Grade Level", f"{readability['flesch_kincaid']}")
+            with r3:
+                st.metric("Reading Level", readability["grade_label"])
 
-        with col_type:
+            ease  = readability["flesch_ease"]
+            color = "🔴" if ease < 30 else ("🟡" if ease < 60 else "🟢")
+            st.caption(f"{color} {readability['ease_label']} — {ease}/100 ease score")
+
+            if text_stats:
+                t1, t2, t3 = st.columns(3)
+                with t1:
+                    st.metric("Avg Sentence", f"{text_stats.get('avg_sentence_length', 0):.1f} words")
+                with t2:
+                    st.metric("Avg Word Length", f"{text_stats.get('avg_word_length', 0):.1f} chars")
+                with t3:
+                    st.metric("Sentences", f"{text_stats.get('total_sentences', 0):,}")
+            st.divider()
+
+        # Row 2: Content type
+        if content_type:
             st.markdown("**🔍 Content Type**")
-            if content_type:
-                ct   = content_type.get("type", "General")
-                conf = content_type.get("confidence", 0)
-                type_icons = {
-                    "Academic":            "🎓",
-                    "Report / Analysis":   "📈",
-                    "Fiction / Narrative": "📚",
-                    "News / Article":      "📰",
-                    "Technical":           "⚙️",
-                    "Legal":               "⚖️",
-                    "General":             "📄",
-                }
-                st.metric(f"{type_icons.get(ct, '📄')} Detected Type", ct)
-                st.caption(f"Confidence: {conf}%")
-                for label, score in sorted(
-                    content_type.get("all_scores", {}).items(),
-                    key=lambda x: x[1], reverse=True
-                )[:3]:
-                    if score > 0:
-                        st.caption(f"  • {label}: {score} signals")
+            ctype  = content_type.get("type", "General")
+            cconf  = content_type.get("confidence", 0)
+            scores = content_type.get("all_scores", {})
+            icon_map = {
+                "Academic":            "🎓",
+                "Report / Analysis":   "📈",
+                "Fiction / Narrative": "📖",
+                "News / Article":      "📰",
+                "Technical":           "⚙️",
+                "Legal":               "⚖️",
+                "General":             "📄",
+            }
+            st.metric("Detected Type", f"{icon_map.get(ctype, '📄')} {ctype}")
+            st.caption(f"Confidence: {cconf}%")
+            top_scores = sorted(scores.items(), key=lambda x: -x[1])[:3]
+            for t, s in top_scores:
+                if s > 0:
+                    st.caption(f"• {t}: {s} signals")
+            st.divider()
 
-        st.divider()
-
-        # Row 3: summary + sentiment
-        col_sum, col_sent = st.columns([3, 2])
-
-        with col_sum:
+        # Row 3: Summary
+        if summary:
             st.markdown("**📝 Summary**")
-            if summary:
-                st.write(summary)
-                st.caption("Extractive — first 3 content sentences.")
-            else:
-                st.caption("Summary unavailable.")
+            st.write(summary)
+            st.caption("Extractive — first 3 content sentences.")
+            st.divider()
 
-        with col_sent:
+        # Row 4: Sentiment
+        if sentiment:
             st.markdown("**🎭 Tone & Sentiment**")
-            if sentiment:
-                label = sentiment.get("label", "Unknown")
-                conf  = sentiment.get("confidence", "low")
-                pos   = sentiment.get("positive_count", 0)
-                neg   = sentiment.get("negative_count", 0)
-                color_map = {"Positive": "🟢", "Negative": "🔴", "Neutral": "🟡"}
-                st.metric(f"{color_map.get(label, '⚪')} Tone", label)
-                st.caption(f"Confidence: {conf}")
-                st.caption(f"🟢 {pos} positive  •  🔴 {neg} negative")
+            tone       = sentiment.get("label", "Neutral")
+            conf       = sentiment.get("confidence", "low")
+            pos_count  = sentiment.get("positive_count", 0)
+            neg_count  = sentiment.get("negative_count", 0)
+            tone_color = "🟢" if tone == "Positive" else ("🔴" if tone == "Negative" else "🟡")
+            st.metric("Tone", f"{tone_color} {tone}")
+            st.caption(f"Confidence: {conf}")
+            st.caption(f"🟢 {pos_count} positive • 🔴 {neg_count} negative")
+            st.divider()
 
-        st.divider()
-
-        # Row 4: topic density
+        # Row 5: Topic density
         if topic_density:
-            st.markdown("**🔑 Topic Density** *(occurrences per 1,000 words)*")
+            st.markdown("**🔑 Topic Density (occurrences per 1,000 words)**")
             for item in topic_density[:12]:
                 word    = item["word"]
                 density = item["density_per_1k"]
-                bar_pct = item["bar_pct"]
                 count   = item["count"]
+                bar_pct = item["bar_pct"]
                 filled  = int(bar_pct / 5)
-                bar     = "█" * filled + "░" * (20 - filled)
-                st.markdown(f"`{word:<18}` {bar} **{density}**/1k  *(×{count})*")
+                empty   = 20 - filled
+                bar     = "█" * filled + "░" * empty
+                st.markdown(
+                    f"`{word:<18}` `{bar}` {density:.2f}/1k (×{count})"
+                )
             st.divider()
 
-        # Row 5: chapter complexity
+        # Row 6: Chapter complexity
         if chapter_complexity:
-            st.markdown("**📊 Complexity by Chapter** *(hardest → easiest to follow while listening)*")
+            st.markdown("**📊 Complexity by Chapter (hardest → easiest to follow while listening)**")
             for item in chapter_complexity:
-                title = item["title"]
-                ease  = item["flesch_ease"]
-                label = item["ease_label"]
-                wc    = item["word_count"]
-                icon  = "🔴" if ease < 50 else ("🟡" if ease < 70 else "🟢")
-                short = title if len(title) <= 40 else title[:37] + "…"
-                st.markdown(f"{icon} **{short}** — {label} ({ease}/100) · {wc:,} words")
+                ease   = item["flesch_ease"]
+                label  = item["ease_label"]
+                title  = item["title"]
+                wc     = item["word_count"]
+                color  = "🔴" if ease < 30 else ("🟡" if ease < 60 else "🟢")
+                short  = title if len(title) <= 40 else title[:37] + "…"
+                st.caption(f"{color} **{short}** — {label} ({ease}/100) · {wc:,} words")
             st.divider()
 
-        # Row 6: Lexical diversity (new KPI)
+        # Row 7: Lexical diversity
         if lexical_diversity:
             st.markdown("**🔤 Lexical Diversity**")
             st.caption(
@@ -1209,63 +972,49 @@ class UIComponents:
                 st.metric("Type-Token Ratio", f"{lexical_diversity.get('ttr', 0)}%")
             with ld3:
                 st.metric("Hapax Words", f"{lexical_diversity.get('hapax_count', 0):,}",
-                          help="Words appearing exactly once — indicator of specialized vocabulary")
+                          help="Words appearing exactly once")
             with ld4:
                 st.metric("Avg Word Frequency", f"{lexical_diversity.get('avg_word_frequency', 0)}×")
             st.divider()
 
-        # Row 7: Sentence complexity (new KPI)
+        # Row 8: Sentence complexity
         if sentence_complexity:
             st.markdown("**📏 Sentence Complexity** *(audio comprehension impact)*")
             long_pct = sentence_complexity.get("long_sentence_pct", 0)
             long_n   = sentence_complexity.get("long_sentence_count", 0)
             longest  = sentence_complexity.get("longest_sentence_words", 0)
-            sc_color = "🔴" if long_pct > 30 else ("🟡" if long_pct > 15 else "🟢")
             sc1, sc2, sc3 = st.columns(3)
             with sc1:
-                st.metric(
-                    "Long Sentences (>30 words)",
-                    f"{long_n} ({long_pct}%)",
-                    help="Sentences over 30 words are difficult to follow while listening"
-                )
+                st.metric("Long Sentences (>30 words)", f"{long_n} ({long_pct}%)",
+                          help="Hard to follow while listening")
             with sc2:
                 st.metric("Longest Sentence", f"{longest} words")
             with sc3:
                 st.metric("Short Fragments (<5 words)",
                           f"{sentence_complexity.get('short_sentence_count', 0)}")
             if long_pct > 20:
+                sc_color = "🔴" if long_pct > 30 else "🟡"
                 st.caption(
                     f"{sc_color} {long_pct}% of sentences are long (>30 words). "
                     "Consider using a slower playback speed for complex sections."
                 )
             st.divider()
 
-        # Row 8: entities
+        # Row 9: Entities
         if characters:
             st.markdown("**👥 Recurring Names / Entities**")
             st.write("  •  ".join(characters[:20]))
             st.divider()
 
-        # Row 9: keywords
+        # Row 10: Keywords
         if keywords:
             st.markdown("**💬 Top Keywords**")
             kw_parts = [f"**{w}** ({ct})" for w, ct in keywords[:15]]
             st.write("  •  ".join(kw_parts))
 
     # ================================================================== #
-    # SECTION 8 — COST + FEEDBACK                                         #
+    # SECTION 8 — FEEDBACK / ERROR RENDERING                              #
     # ================================================================== #
-
-    @staticmethod
-    def render_cost_estimate(chapters: OrderedDict, tts_engine: str) -> None:
-        if tts_engine != "openai":
-            return
-        total_chars = sum(len(t) for t in chapters.values())
-        cost_usd    = (total_chars / 1000) * 0.015
-        st.info(
-            f"💰 **OpenAI TTS estimate:** {total_chars:,} characters — "
-            f"~${cost_usd:.3f} USD at $0.015/1,000 chars."
-        )
 
     @staticmethod
     def render_error(message: str) -> None:
@@ -1276,13 +1025,5 @@ class UIComponents:
         st.success(f"✅ {message}")
 
     @staticmethod
-    def render_warning(message: str) -> None:
-        st.warning(f"⚠️ {message}")
-
-    @staticmethod
     def render_info(message: str) -> None:
         st.info(f"ℹ️ {message}")
-
-    @staticmethod
-    def render_spinner_placeholder(message: str = "Processing…") -> None:
-        st.info(f"⏳ {message}")
